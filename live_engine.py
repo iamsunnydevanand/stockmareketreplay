@@ -1,3 +1,4 @@
+import os
 from flask import Flask, jsonify, render_template_string, request, session, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -10,7 +11,10 @@ import json
 
 app = Flask(__name__)
 app.secret_key = "sunny_dev_anand_secret_123"
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///final_app.db'
+
+# Render ke liye database path fix (Disk attach kiya hai toh /data/final_app.db banega)
+db_path = os.environ.get('DATABASE_PATH', 'final_app.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
@@ -31,6 +35,7 @@ class User(db.Model):
 with app.app_context():
     db.create_all()
     if not User.query.filter_by(username="admin").first():
+        # 🔐 Admin Password Yahan Change Karein (Abhi admin123 hai)
         admin = User(username="admin", password=generate_password_hash("admin123"), is_admin=True)
         db.session.add(admin)
         db.session.commit()
@@ -59,7 +64,11 @@ def ensure_login():
 
 @app.route('/')
 def index():
-    return redirect(url_for('login'))
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    if session.get('is_admin'):
+        return redirect(url_for('admin_panel'))
+    return redirect(url_for('terminal'))
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -115,10 +124,20 @@ def toggle_user(user_id):
 
 @app.route('/terminal')
 def terminal():
-    if 'user_id' not in session: return redirect(url_for('login'))
+    if 'user_id' not in session: 
+        return redirect(url_for('login'))
+    
     user = User.query.get(session['user_id'])
-    if not user or not user.is_active: session.clear(); return redirect(url_for('login'))
-    if user.is_admin: return redirect(url_for('admin_panel'))
+    
+    if not user or not user.is_active: 
+        session.clear()
+        return redirect(url_for('login'))
+    
+    # Admin ko full access (bina trial ke)
+    if user.is_admin:
+        return render_template_string(TERMINAL_HTML, trial=999999, username=session['username'])
+        
+    # Normal users ko 2 minute ka trial
     trial_remaining = max(0, 120 - int(time.time() - session.get('login_time', time.time())))
     return render_template_string(TERMINAL_HTML, trial=trial_remaining, username=session['username'])
 
@@ -214,15 +233,15 @@ REGISTER_HTML = f"""
 </div></body></html>
 """
 
-ADMIN_HTML = f"""
+ADMIN_HTML = """
 <!DOCTYPE html><html><head><title>Admin Panel</title>
-<style>body{{background:#131722;color:white;font-family:sans-serif;padding:20px;}}h2{{color:#2962ff;}}table{{width:100%;border-collapse:collapse;margin-top:20px;}}th,td{{padding:10px;border-bottom:1px solid #2a2e39;text-align:left;}}th{{color:#787b86;}}.btn{{padding:5px 10px;border-radius:4px;text-decoration:none;font-size:12px;color:white;}}.btn-red{{background:#ef5350;}}.btn-green{{background:#089981;}}</style></head>
+<style>body{background:#131722;color:white;font-family:sans-serif;padding:20px;}h2{color:#2962ff;}table{width:100%;border-collapse:collapse;margin-top:20px;}th,td{padding:10px;border-bottom:1px solid #2a2e39;text-align:left;}th{color:#787b86;}.btn{padding:5px 10px;border-radius:4px;text-decoration:none;font-size:12px;color:white;}.btn-red{background:#ef5350;}.btn-green{background:#089981;}</style></head>
 <body><h2>Admin Panel</h2><a href="/terminal" style="color:#2962ff;">&larr; Terminal</a> | <a href="/logout" style="color:#ef5350;">Logout</a>
 <table><tr><th>ID</th><th>Username</th><th>Status</th><th>PnL</th><th>Action</th></tr>
-{{% for user in users %}}<tr><td>{{{{ user.id }}}}</td><td>{{{{ user.username }}}}</td>
-<td style="color:{{% if user.is_active %}}#089981{{% else %}}#ef5350{{% endif %}};">{{% if user.is_active %}}Active{{% else %}}Blocked{{% endif %}}</td>
-<td>₹ {{{{ user.realized_pnl }}}}</td>
-<td>{{% if user.is_active %}}<a href="/admin/toggle/{{{{ user.id }}}}" class="btn btn-red">Block</a>{{% else %}}<a href="/admin/toggle/{{{{ user.id }}}}" class="btn btn-green">Activate</a>{{% endif %}}</td></tr>{{% endfor %}}
+{% for user in users %}<tr><td>{{ user.id }}</td><td>{{ user.username }}</td>
+<td style="color:{% if user.is_active %}#089981{% else %}#ef5350{% endif %};">{% if user.is_active %}Active{% else %}Blocked{% endif %}</td>
+<td>₹ {{ user.realized_pnl }}</td>
+<td>{% if user.is_active %}<a href="/admin/toggle/{{ user.id }}" class="btn btn-red">Block</a>{% else %}<a href="/admin/toggle/{{ user.id }}" class="btn btn-green">Activate</a>{% endif %}</td></tr>{% endfor %}
 </table></body></html>
 """
 
