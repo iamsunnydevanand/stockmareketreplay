@@ -5,3 +5,4 @@ smartapi-python
 pyotp
 gunicorn
 logzero
+websocket-client
