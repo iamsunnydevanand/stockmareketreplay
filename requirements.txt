@@ -4,3 +4,4 @@ Werkzeug
 smartapi-python
 pyotp
 gunicorn
+logzero
