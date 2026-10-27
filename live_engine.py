@@ -17,6 +17,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
+# --- DATABASE MODEL ---
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
@@ -31,6 +32,7 @@ with app.app_context():
         db.session.add(admin)
         db.session.commit()
 
+# --- SMARTAPI DETAILS ---
 api_key = "BAq0de8E"                 
 client_id = "S1263568"               
 password = "7313"                    
@@ -118,6 +120,7 @@ def execute_square_off(exit_price, reason="Manual"):
     position = None; entry_price = 0.0; sl_price = 0.0; target_price = 0.0; tsl_points = 0.0; pnl = 0.0
     return final_pnl
 
+# --- OWNER INFO HTML ---
 OWNER_HTML = """
 <div style="margin-top:20px; padding:15px; background:#131722; border:1px solid #2962ff; border-radius:8px; text-align:center; font-size:12px;">
     <h4 style="margin:0 0 5px 0; color:#089981;">Owner Info</h4>
@@ -128,6 +131,7 @@ OWNER_HTML = """
 </div>
 """
 
+# --- AUTH ROUTES ---
 @app.route('/')
 def index():
     if 'user_id' not in session: return redirect(url_for('login'))
@@ -183,6 +187,7 @@ def toggle_user(user_id):
         if user: user.is_active = not user.is_active; db.session.commit()
     return redirect(url_for('admin_panel'))
 
+# --- TERMINAL ROUTE ---
 @app.route('/terminal')
 def home():
     if 'user_id' not in session: return redirect(url_for('login'))
@@ -195,21 +200,24 @@ def home():
     trial_remaining = max(0, 120 - int(time.time() - session.get('login_time', time.time())))
     return render_template_string(HTML_PAGE, trial=trial_remaining, username=session['username'])
 
+# --- API ROUTES ---
 @app.route('/api/change_symbol/<symbol>')
 def change_symbol(symbol):
-    global current_symbol, real_data, current_candle_index, candle_progress, needs_history_reload
+    global current_symbol, real_data, current_candle_index, candle_progress, needs_history_reload, is_playing, smooth_price, current_high, current_low
     if symbol in INDICES:
         if position is not None and last_ltp > 0: execute_square_off(last_ltp, reason="Symbol Switch")
         current_symbol = symbol
         real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True
+        is_playing = True; smooth_price = 0.0; current_high = 0.0; current_low = 0.0
         return jsonify({"status": "success"})
     return jsonify({"status": "error"})
 
 @app.route('/api/set_interval/<interval>')
 def set_interval(interval):
-    global current_interval, real_data, current_candle_index, candle_progress, needs_history_reload
+    global current_interval, real_data, current_candle_index, candle_progress, needs_history_reload, is_playing, smooth_price, current_high, current_low
     current_interval = interval
     real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True
+    is_playing = True; smooth_price = 0.0; current_high = 0.0; current_low = 0.0
     return jsonify({"status": "success"})
 
 @app.route('/api/set_speed/<int:speed>')
@@ -220,9 +228,19 @@ def set_speed(speed):
 
 @app.route('/api/set_date')
 def set_date():
-    global selected_date, real_data, current_candle_index, candle_progress, needs_history_reload, last_real_time
+    global selected_date, real_data, current_candle_index, candle_progress, needs_history_reload, last_real_time, is_playing, smooth_price, current_high, current_low
     selected_date = request.args.get('date')
-    real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True; last_real_time = time.time()
+    
+    # Data Reset
+    real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True
+    last_real_time = time.time()
+    
+    # 🔥 PLAY BUG FIX 🔥
+    is_playing = True 
+    smooth_price = 0.0
+    current_high = 0.0
+    current_low = 0.0
+    
     return jsonify({"status": "success", "selected_date": selected_date})
 
 @app.route('/api/toggle_play', methods=['POST'])
@@ -283,7 +301,7 @@ def get_tick():
 
     now = time.time()
     if is_playing:
-        # 🔥 300 SECONDS DIVISOR 🔥
+        # 300 Seconds Divisor
         candle_progress += ((now - last_real_time) / 300.0) * playback_speed
         last_real_time = now
         if candle_progress >= 1.0:
@@ -304,7 +322,7 @@ def get_tick():
     c = real_data[current_candle_index]
     open_p, high_p, low_p, close_p = float(c[1]), float(c[2]), float(c[3]), float(c[4])
 
-    # 🔥 SMOOTH TICK LOGIC (Ultra Smooth) 🔥
+    # Smooth Tick Logic
     if candle_progress < 0.35:
         target_p = low_p if close_p >= open_p else high_p
         guide_p = open_p + (target_p - open_p) * (candle_progress / 0.35)
@@ -318,10 +336,9 @@ def get_tick():
 
     if smooth_price == 0.0: smooth_price = open_p
     
-    # 🔥 TIGHT MICRO-NOISE (-0.05 to +0.05) 🔥
+    # Tight Micro-Noise
     micro_noise = random.uniform(-0.05, 0.05) * max(1.0, (high_p - low_p) * 0.01)
     
-    # Smoothing factor (0.15 for ultra smooth)
     smooth_price = smooth_price + (guide_p - smooth_price) * 0.15 + micro_noise
     current_price = round(max(low_p, min(high_p, smooth_price)), 2)
 
@@ -444,6 +461,7 @@ def close_trade():
     final_pnl = execute_square_off(last_ltp, reason="Manual")
     return jsonify({"status": "success", "final_pnl": final_pnl})
 
+# --- HTML TEMPLATES ---
 LOGIN_HTML = f"""
 <!DOCTYPE html><html><head><title>Login</title>
 <style>body{{background:#131722;color:white;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}}.box{{background:#1e222d;padding:40px;border-radius:10px;width:350px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);}}h2{{margin-top:0;color:#2962ff;}}input{{width:100%;padding:10px;margin:10px 0;background:#131722;border:1px solid #2a2e39;color:white;border-radius:5px;box-sizing:border-box;}}button{{width:100%;padding:10px;background:#2962ff;color:white;border:none;border-radius:5px;cursor:pointer;font-weight:bold;margin-top:10px;}}.error{{color:#ef5350;margin-bottom:10px;}}</style></head>
@@ -624,7 +642,8 @@ HTML_PAGE = """
     <div class="top-right">
       <span class="trial-timer" id="trialTimerDisplay"></span>
       <button class="ctrl-btn" id="barCutterBtn" onclick="toggleBarCutter()" title="Click any candle to replay from there">✂️ <span>Cut</span></button>
-      <input type="date" id="datePicker" class="top-input" value="2026-10-26" title="Select Replay Date">
+      <!-- DATE PICKER YAHAN HAI -->
+      <input type="date" id="datePicker" class="top-input" value="2026-10-26" title="Select Replay Date" style="width: 130px;">
       <button class="ctrl-btn" id="playPauseBtn" onclick="togglePlay()" title="Play/Pause (Space)">⏸ Pause</button>
       <button class="ctrl-btn" onclick="stepForward()" title="Next Candle (&gt;|)">&gt;|</button>
       <button class="ctrl-btn" onclick="resetSimulation()" title="Reset (R)">🔄 Reset</button>
@@ -872,9 +891,37 @@ HTML_PAGE = """
       await fetch('/api/set_speed/' + document.getElementById('speedControl').value);
     }
 
+    // 🔥 DATE PICKER CHANGE EVENT 🔥
     document.getElementById('datePicker').addEventListener('change', async () => {
-      allCandles = []; candleSeries.setData([]); removePositionLines();
-      await fetch('/api/set_date?date=' + document.getElementById('datePicker').value);
+      let selectedDate = document.getElementById('datePicker').value;
+      if(!selectedDate) return;
+      
+      allCandles = []; 
+      candleSeries.setData([]); 
+      removePositionLines();
+      document.getElementById('tradePanel').style.display = 'none';
+      document.getElementById('chSymbol').innerText = "Loading data...";
+      document.getElementById('playPauseBtn').innerText = '⏸ Pause';
+      
+      // Backend ko date bhejo (Yeh is_playing = True karega)
+      await fetch('/api/set_date?date=' + selectedDate);
+      
+      // UI update karo
+      document.getElementById('syncedDhanClock').innerText = `${selectedDate} 09:15:00 UTC+5:30`;
+      showToast(`Data loading for ${selectedDate}...`);
+      
+      // 1.5 sec baad verify karein
+      setTimeout(async () => {
+        try {
+            const res = await fetch('/api/get_tick');
+            const data = await res.json();
+            if (data.status === 'success' && data.current_candle) {
+                showToast(`✅ Loaded: ${selectedDate}`);
+            } else {
+                showToast(`❌ No data for ${selectedDate} (Weekend/Holiday?)`);
+            }
+        } catch(e) {}
+      }, 1500);
     });
 
     async function togglePlay() {
@@ -947,10 +994,12 @@ HTML_PAGE = """
         const result = await response.json();
         if (result.status === 'success') {
           if (result.synced_time_str) document.getElementById('syncedDhanClock').innerText = result.synced_time_str;
+          
           if (result.history && result.history.length > 0) {
             allCandles = result.history;
             candleSeries.setData(allCandles);
           }
+          
           if (result.current_candle) {
             const c = result.current_candle;
             currentUnderlyingPrice = c.close;
@@ -969,6 +1018,7 @@ HTML_PAGE = """
             document.getElementById('chSymbol').innerText = `${result.symbol} · ${result.interval_name} · ${result.exchange}`;
             document.getElementById('miniBadge').innerText = result.symbol.substring(0, 6);
           }
+          
           const rPnl = result.realized_pnl || 0;
           document.getElementById('footerRealizedPnl').innerText = `${rPnl >= 0 ? '+' : ''}₹ ${rPnl.toFixed(2)}`;
           renderTradeHistory(result.trade_history);
