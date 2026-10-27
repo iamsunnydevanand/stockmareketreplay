@@ -1,1060 +1,692 @@
+"""Single-file Paper Trading Replay Terminal.
+
+Local: pip install Flask Flask-SQLAlchemy smartapi-python pyotp; python main.py
+Render: set DATABASE_URL to Render PostgreSQL; install gunicorn and psycopg[binary];
+        start with: gunicorn -w 2 --threads 4 -b 0.0.0.0:$PORT main:app
+Paper trading only. No broker orders are ever placed.
+"""
+from __future__ import annotations
+
+import json
+import logging
 import os
-from flask import Flask, jsonify, render_template_string, request, session, redirect, url_for
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
-from SmartApi import SmartConnect
-from pyotp import TOTP
-from datetime import datetime
-import time
 import random
+import secrets
+import threading
+import time
+from collections import defaultdict, deque
+from datetime import date, datetime, time as clock_time
+from functools import wraps
+from zoneinfo import ZoneInfo
+
+import pyotp
+from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import inspect, text
+from SmartApi import SmartConnect
+from werkzeug.security import check_password_hash, generate_password_hash
+
+# Credentials requested for the Angel One SmartAPI connection.
+API_KEY = "BAq0de8E"
+CLIENT_ID = "S1263568"
+PASSWORD = "7313"
+TOTP_SECRET = "LY4QG5NPAOBDYIZXODIDWLQKN4"
+
+INDICES = {
+    "SENSEX": {"token": "99919000", "exchange": "BSE", "lot": 10},
+    "NIFTY": {"token": "99926000", "exchange": "NSE", "lot": 50},
+    "BANKNIFTY": {"token": "99926009", "exchange": "NSE", "lot": 15},
+}
+INTERVALS = {"ONE_MINUTE": "1m", "FIVE_MINUTE": "5m", "FIFTEEN_MINUTE": "15m"}
+IST = ZoneInfo("Asia/Kolkata")
+SPEEDS = {1, 2, 5, 10, 25, 50}
+TRIAL_SECONDS = 120
 
 app = Flask(__name__)
-app.secret_key = "sunny_dev_anand_secret_123"
-
-# Render ke liye database path
-db_path = os.environ.get('DATABASE_PATH', 'final_app.db')
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+render_runtime = bool(os.environ.get("RENDER"))
+configured_database_url = os.environ.get("DATABASE_URL")
+configured_secret_key = os.environ.get("SECRET_KEY")
+if render_runtime and not configured_database_url:
+    raise RuntimeError("Render deployment requires DATABASE_URL pointing to a persistent PostgreSQL database.")
+if render_runtime and not configured_secret_key:
+    raise RuntimeError("Render deployment requires a stable SECRET_KEY shared by every app instance.")
+database_uri = configured_database_url or "sqlite:///final_app.db"
+if database_uri.startswith("postgres://"):
+    database_uri = "postgresql+psycopg://" + database_uri[len("postgres://"): ]
+elif database_uri.startswith("postgresql://"):
+    database_uri = "postgresql+psycopg://" + database_uri[len("postgresql://"): ]
+engine_options = {}
+if database_uri.startswith("sqlite:"):
+    engine_options = {"connect_args": {"check_same_thread": False, "timeout": 30}}
+app.config.update(
+    SECRET_KEY=configured_secret_key or secrets.token_urlsafe(48),
+    SQLALCHEMY_DATABASE_URI=database_uri,
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    SQLALCHEMY_ENGINE_OPTIONS=engine_options,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "true" if render_runtime else "false").lower() == "true",
+    PERMANENT_SESSION_LIFETIME=8 * 60 * 60,
+    MAX_CONTENT_LENGTH=64 * 1024,
+)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
+log = logging.getLogger("paper-replay")
 db = SQLAlchemy(app)
 
-# --- DATABASE MODEL ---
+
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password = db.Column(db.String(200), nullable=False)
-    is_admin = db.Column(db.Boolean, default=False)
-    is_active = db.Column(db.Boolean, default=True)
+    username = db.Column(db.String(80), unique=True, nullable=False, index=True)
+    password = db.Column(db.String(255), nullable=False)
+    is_admin = db.Column(db.Boolean, nullable=False, default=False)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    valid_until = db.Column(db.Float, nullable=True)
+    trial_started_at = db.Column(db.Float, nullable=True)
+    auth_version = db.Column(db.Integer, nullable=False, default=0)
+
+
+class TradingState(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id", ondelete="CASCADE"), unique=True, nullable=False, index=True)
+    symbol = db.Column(db.String(20), nullable=False, default="SENSEX")
+    interval = db.Column(db.String(20), nullable=False, default="FIVE_MINUTE")
+    selected_date = db.Column(db.String(10), nullable=False, default=lambda: datetime.now(IST).date().isoformat())
+    real_data_json = db.Column(db.Text, nullable=False, default="[]")
+    candle_index = db.Column(db.Integer, nullable=False, default=0)
+    candle_progress = db.Column(db.Float, nullable=False, default=0.0)
+    last_tick_at = db.Column(db.Float, nullable=False, default=0.0)
+    is_playing = db.Column(db.Boolean, nullable=False, default=True)
+    playback_speed = db.Column(db.Integer, nullable=False, default=1)
+    smooth_price = db.Column(db.Float, nullable=False, default=0.0)
+    current_high = db.Column(db.Float, nullable=False, default=0.0)
+    current_low = db.Column(db.Float, nullable=False, default=0.0)
+    last_ltp = db.Column(db.Float, nullable=False, default=0.0)
+    position = db.Column(db.String(8))
+    position_label = db.Column(db.String(80), nullable=False, default="")
+    entry_price = db.Column(db.Float, nullable=False, default=0.0)
+    stop_loss = db.Column(db.Float, nullable=False, default=0.0)
+    target_price = db.Column(db.Float, nullable=False, default=0.0)
+    trailing_points = db.Column(db.Float, nullable=False, default=0.0)
+    highest_price = db.Column(db.Float, nullable=False, default=0.0)
+    lowest_price = db.Column(db.Float, nullable=False, default=0.0)
+    lots = db.Column(db.Integer, nullable=False, default=1)
+    unrealized_pnl = db.Column(db.Float, nullable=False, default=0.0)
+    realized_pnl = db.Column(db.Float, nullable=False, default=0.0)
+    trade_history_json = db.Column(db.Text, nullable=False, default="[]")
+    needs_history_reload = db.Column(db.Boolean, nullable=False, default=True)
+
+
+class RuntimeSetting(db.Model):
+    key = db.Column(db.String(80), primary_key=True)
+    value = db.Column(db.String(255), nullable=False)
+
 
 with app.app_context():
     db.create_all()
-    if not User.query.filter_by(username="admin").first():
-        admin = User(username="admin", password=generate_password_hash("admin123"), is_admin=True)
-        db.session.add(admin)
+    # Lightweight additive migration for existing final_app.db deployments.
+    user_columns = {column["name"] for column in inspect(db.engine).get_columns("user")}
+    with db.engine.begin() as connection:
+        if "valid_until" not in user_columns:
+            connection.execute(text('ALTER TABLE "user" ADD COLUMN valid_until DOUBLE PRECISION'))
+        if "trial_started_at" not in user_columns:
+            connection.execute(text('ALTER TABLE "user" ADD COLUMN trial_started_at DOUBLE PRECISION'))
+        if "auth_version" not in user_columns:
+            connection.execute(text('ALTER TABLE "user" ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0'))
+    # Bootstrap the requested admin once. This also repairs an older final_app.db
+    # whose admin credentials predate this build; later restarts preserve changes.
+    if db.session.get(RuntimeSetting, "admin_bootstrap_v1") is None:
+        admin_user = db.session.execute(db.select(User).filter_by(username="admin")).scalar_one_or_none()
+        bootstrap_password = os.environ.get("ADMIN_PASSWORD", "admin123")
+        if admin_user is None:
+            admin_user = User(username="admin", password=generate_password_hash(bootstrap_password), is_admin=True, is_active=True)
+            db.session.add(admin_user)
+        else:
+            admin_user.password = generate_password_hash(bootstrap_password)
+            admin_user.is_admin = True
+            admin_user.is_active = True
+        db.session.add(RuntimeSetting(key="admin_bootstrap_v1", value="complete"))
         db.session.commit()
 
-# --- SMARTAPI DETAILS ---
-api_key = "BAq0de8E"                 
-client_id = "S1263568"               
-password = "7313"                    
-totp_secret = "LY4QG5NPAOBDYIZXODIDWLQKN4"  
+smart = SmartConnect(api_key=API_KEY)
+smart_ready = False
+smart_lock = threading.Lock()
+state_lock = threading.RLock()
+cache_lock = threading.RLock()
+history_cache = {}
+login_attempts = defaultdict(deque)
+login_lock = threading.Lock()
 
-obj = SmartConnect(api_key=api_key)
-session_initialized = False
 
-INDICES = {
-    "SENSEX":     {"token": "99919000", "exchange": "BSE", "name": "SENSEX",     "lot": 10, "step": 100},
-    "BANKEX":     {"token": "99919001", "exchange": "BSE", "name": "BANKEX",     "lot": 15, "step": 100},
-    "NIFTY":      {"token": "99926000", "exchange": "NSE", "name": "NIFTY 50",   "lot": 50, "step": 50},
-    "BANKNIFTY":  {"token": "99926009", "exchange": "NSE", "name": "BANKNIFTY",  "lot": 15, "step": 100},
-    "FINNIFTY":   {"token": "99926037", "exchange": "NSE", "name": "FINNIFTY",   "lot": 40, "step": 50},
-    "MIDCPNIFTY": {"token": "99926074", "exchange": "NSE", "name": "MIDCPNIFTY", "lot": 75, "step": 25},
-    "NIFTYIT":    {"token": "99926008", "exchange": "NSE", "name": "NIFTY IT",   "lot": 25, "step": 100},
-    "NIFTYAUTO":  {"token": "99926029", "exchange": "NSE", "name": "NIFTY AUTO", "lot": 25, "step": 100},
-    "NIFTYPHARMA":{"token": "99926023", "exchange": "NSE", "name": "NIFTY PHARMA","lot": 25, "step": 50}
-}
+def csrf_token():
+    if not session.get("_csrf"):
+        session["_csrf"] = secrets.token_urlsafe(32)
+    return session["_csrf"]
 
-# --- SIMULATION & TRADING STATE ---
-current_symbol = "SENSEX"
-current_interval = "FIVE_MINUTE"
-selected_date = "2026-10-26" 
-real_data = []
-current_candle_index = 0
-candle_progress = 0.0 
-last_real_time = time.time()
-is_playing = True
-playback_speed = 1 
-needs_history_reload = True
 
-smooth_price = 0.0
-current_high = 0.0
-current_low = 0.0
+def get_state(user_id):
+    state = db.session.execute(db.select(TradingState).filter_by(user_id=user_id)).scalar_one_or_none()
+    if state is None:
+        state = TradingState(user_id=user_id, selected_date=datetime.now(IST).date().isoformat())
+        db.session.add(state)
+        db.session.commit()
+    return state
 
-position = None          
-instrument_label = "SENSEX"
-entry_price = 0.0
-sl_price = 0.0
-target_price = 0.0
-tsl_points = 0.0
-highest_price = 0.0      
-lowest_price = 0.0
-qty_lots = 1
-pnl = 0.0
-realized_pnl = 0.0
-last_ltp = 0.0
-trade_history = []
 
-def ensure_login():
-    global session_initialized
-    if not session_initialized:
+def rows_of(state):
+    try:
+        value = json.loads(state.real_data_json or "[]")
+        return value if isinstance(value, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
+def history_of(state):
+    try:
+        value = json.loads(state.trade_history_json or "[]")
+        return value if isinstance(value, list) else []
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
+def ensure_smart_login():
+    global smart_ready
+    if smart_ready:
+        return
+    with smart_lock:
+        if smart_ready:
+            return
+        answer = smart.generateSession(CLIENT_ID, PASSWORD, pyotp.TOTP(TOTP_SECRET).now())
+        if not answer or not answer.get("status"):
+            raise RuntimeError("SmartAPI login failed: " + str((answer or {}).get("message", "unknown error")))
+        smart_ready = True
+        log.info("SmartAPI login successful")
+
+
+def fetch_candles(symbol, interval, selected_date):
+    key = (symbol, interval, selected_date)
+    with cache_lock:
+        if key in history_cache:
+            return history_cache[key]
+    day = date.fromisoformat(selected_date)
+    now = datetime.now(IST)
+    start = datetime.combine(day, clock_time(9, 15), tzinfo=IST)
+    close = datetime.combine(day, clock_time(15, 30), tzinfo=IST)
+    if day == now.date() and now < start:
+        raise ValueError("Market opens at 09:15 IST. Select a past trading date or try after market open.")
+    end = min(now, close) if day == now.date() else close
+    params = {"exchange": INDICES[symbol]["exchange"], "symboltoken": INDICES[symbol]["token"],
+              "interval": interval, "fromdate": f"{day.isoformat()} 09:15", "todate": end.strftime("%Y-%m-%d %H:%M")}
+    ensure_smart_login()
+    response = smart.getCandleData(params)
+    if not response or not response.get("status"):
+        global smart_ready
+        smart_ready = False
+        raise RuntimeError("SmartAPI historical request failed: " + str((response or {}).get("message", "unknown error")))
+    result = []
+    for row in response.get("data") or []:
         try:
-            totp = TOTP(totp_secret).now()
-            res = obj.generateSession(client_id, password, totp)
-            if res and res.get('status'): session_initialized = True
-        except: pass
+            if len(row) < 5:
+                continue
+            stamp = datetime.fromisoformat(str(row[0])).isoformat()
+            o, h, low, c = (float(row[i]) for i in range(1, 5))
+            if min(o, h, low, c) <= 0 or h < max(o, low, c) or low > min(o, h, c):
+                continue
+            result.append([stamp, o, h, low, c, float(row[5] or 0) if len(row) > 5 else 0.0])
+        except (TypeError, ValueError, IndexError):
+            continue
+    with cache_lock:
+        history_cache[key] = result
+    return result
 
-def format_candle(c):
-    ts = int(datetime.fromisoformat(c[0]).timestamp()) + 19800
-    return {"time": ts, "open": float(c[1]), "high": float(c[2]), "low": float(c[3]), "close": float(c[4])}
 
-def reset_candle_bounds():
-    global smooth_price, current_high, current_low
-    if len(real_data) > 0 and current_candle_index < len(real_data):
-        o = float(real_data[current_candle_index][1])
-        smooth_price = o
-        current_high = o
-        current_low = o
+def reset_bounds(state, rows):
+    if rows and 0 <= state.candle_index < len(rows):
+        op = float(rows[state.candle_index][1])
+        state.smooth_price = state.current_high = state.current_low = op
 
-def execute_square_off(exit_price, reason="Manual"):
-    global position, instrument_label, entry_price, sl_price, target_price, tsl_points, pnl, realized_pnl, trade_history
-    if position is None: return 0.0
-    lot_size = INDICES[current_symbol]["lot"]
-    total_qty = lot_size * qty_lots
-    final_pnl = (exit_price - entry_price) * total_qty if position == 'LONG' else (entry_price - exit_price) * total_qty
-    final_pnl = round(final_pnl, 2)
-    realized_pnl = round(realized_pnl + final_pnl, 2)
-    trade_history.insert(0, {
-        "symbol": instrument_label, "type": position, "qty": total_qty,
-        "entry": round(entry_price, 2), "exit": round(exit_price, 2),
-        "pnl": final_pnl, "reason": reason
-    })
-    position = None; entry_price = 0.0; sl_price = 0.0; target_price = 0.0; tsl_points = 0.0; pnl = 0.0
-    return final_pnl
 
-# --- OWNER INFO HTML ---
-OWNER_HTML = """
-<div style="margin-top:20px; padding:15px; background:#131722; border:1px solid #2962ff; border-radius:8px; text-align:center; font-size:12px;">
-    <h4 style="margin:0 0 5px 0; color:#089981;">Owner Info</h4>
-    <p style="margin:2px; font-weight:bold; color:white;">Sunny Dev Anand</p>
-    <p style="margin:2px; color:#787b86;">Software Engineer</p>
-    <p style="margin:2px;"><a href="mailto:itsmywayokok@gmail.com" style="color:#2962ff; text-decoration:none;">itsmywayokok@gmail.com</a></p>
-    <p style="margin:2px;"><a href="https://wa.me/917667765215" style="color:#089981; text-decoration:none;">+91 7667765215 (WhatsApp)</a></p>
-</div>
+def chart_candle(row):
+    dt = datetime.fromisoformat(row[0])
+    return {"time": int(dt.timestamp()) + 19800, "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4])}
+
+
+def closed_trades(state, reason="Manual square off"):
+    if not state.position:
+        return 0.0
+    size = INDICES.get(state.symbol, INDICES["SENSEX"])["lot"] * state.lots
+    pnl = (state.last_ltp - state.entry_price) * size
+    if state.position == "SHORT":
+        pnl = (state.entry_price - state.last_ltp) * size
+    pnl = round(pnl, 2)
+    state.realized_pnl = round(state.realized_pnl + pnl, 2)
+    trades = history_of(state)
+    trades.insert(0, {"symbol": state.position_label or state.symbol, "type": state.position, "qty": size,
+                      "entry": round(state.entry_price, 2), "exit": round(state.last_ltp, 2), "pnl": pnl,
+                      "reason": reason, "closed_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")})
+    state.trade_history_json = json.dumps(trades[:200])
+    state.position = None
+    state.entry_price = state.stop_loss = state.target_price = state.trailing_points = 0.0
+    state.highest_price = state.lowest_price = state.unrealized_pnl = 0.0
+    state.position_label = ""
+    state.lots = 1
+    return pnl
+
+
+def has_full_access(user):
+    return bool(user and (user.is_admin or (user.valid_until is not None and user.valid_until > time.time())))
+
+
+def trial_left(user):
+    if has_full_access(user):
+        return TRIAL_SECONDS
+    started = user.trial_started_at
+    if started is None:
+        return TRIAL_SECONDS
+    return max(0, TRIAL_SECONDS - int(time.time() - float(started)))
+
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        user_id = session.get("user_id")
+        user = db.session.get(User, user_id) if user_id else None
+        if user is None or not user.is_active or session.get("auth_version") != user.auth_version:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return jsonify(status="error", message="Please sign in again."), 401
+            return redirect(url_for("login"))
+        if request.path.startswith("/api/") and not has_full_access(user) and trial_left(user) <= 0:
+            return jsonify(status="error", message="Access expired. Contact the administrator to renew your validity."), 403
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+def admin_required(fn):
+    @wraps(fn)
+    @login_required
+    def wrapped(*args, **kwargs):
+        if not session.get("is_admin"):
+            return redirect(url_for("home"))
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+@app.before_request
+def csrf_guard():
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        expected = session.get("_csrf", "")
+        supplied = request.headers.get("X-CSRFToken") or request.form.get("csrf_token", "")
+        if not expected or not secrets.compare_digest(expected, supplied):
+            return (jsonify(status="error", message="Refresh the page and retry."), 400) if request.path.startswith("/api/") else ("Refresh the page and retry.", 400)
+
+
+@app.before_request
+def limit_login_attempts():
+    if request.endpoint == "login" and request.method == "POST":
+        ip, now = request.remote_addr or "unknown", time.time()
+        with login_lock:
+            attempts = login_attempts[ip]
+            while attempts and now - attempts[0] > 60:
+                attempts.popleft()
+            if len(attempts) >= 10:
+                return render_template_string(LOGIN_HTML, error="Too many attempts. Wait one minute.", csrf=csrf_token(), owner=OWNER_INFO_HTML), 429
+            attempts.append(now)
+
+
+@app.after_request
+def headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+OWNER_INFO_HTML = """
+<section class="owner"><div class="owner-avatar">SA</div><b>Sunny Dev Anand</b><span>Software Engineer</span>
+<a href="mailto:itsmywayokok@gmail.com">✉ &nbsp; itsmywayokok@gmail.com</a>
+<a href="https://wa.me/917667655215" target="_blank" rel="noopener">◉ &nbsp; +91 7667655215 · WhatsApp</a>
+<small class="owner-caption">Paper Trading Replay Terminal</small></section>
 """
 
-# --- AUTH ROUTES ---
-@app.route('/')
+LOGIN_HTML = r"""
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · Replay Terminal</title><style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#131722;color:#d1d4dc;font:15px Arial}.box{width:min(420px,92vw);padding:30px;background:#1e222d;border:1px solid #2a2e39;border-radius:12px}h1{font-size:23px;margin:0 0 8px;color:white}.muted{color:#9598a1;font-size:13px;margin-bottom:20px}label{display:block;margin:14px 0 6px;font-size:12px}input{width:100%;padding:11px;background:#131722;border:1px solid #363a45;border-radius:5px;color:white}button{width:100%;padding:11px;margin-top:17px;background:#2962ff;color:white;border:0;border-radius:5px;font-weight:bold}.error{padding:9px;background:#3b2027;color:#ff8289}.link{text-align:center;margin:16px}.link a,.owner a{color:#8aa9ff}.owner{display:flex;flex-direction:column;gap:5px;text-align:center;padding:13px;margin-top:18px;background:#131722;border:1px solid #2a2e39;border-radius:7px;font-size:12px}.owner span{color:#9598a1} .owner-avatar{width:40px;height:40px;margin:0 auto;display:grid;place-items:center;border-radius:50%;background:linear-gradient(135deg,#2962ff,#8d57d6);color:#fff;font-weight:800;box-shadow:0 4px 14px #2962ff55}
+</style></head><body><main class="box"><h1>Paper Trading Replay</h1><div class="muted">Sign in to your isolated replay workspace</div>{% if error %}<p class="error">{{ error }}</p>{% endif %}<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf }}"><label>Username</label><input name="username" autocomplete="username" required maxlength="80"><label>Password</label><input name="password" type="password" autocomplete="current-password" required><button>Sign in</button></form><div class="link"><a href="{{ url_for('register') }}">Create account</a></div>{{ owner|safe }}</main></body></html>
+"""
+
+REGISTER_HTML = r"""
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Create account</title><style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#131722;color:#d1d4dc;font:15px Arial}main{width:min(420px,92vw);padding:30px;background:#1e222d;border:1px solid #2a2e39;border-radius:12px}label{display:block;margin:14px 0 6px}input{width:100%;padding:11px;background:#131722;border:1px solid #363a45;border-radius:5px;color:white}button{width:100%;padding:11px;margin-top:18px;background:#2962ff;color:white;border:0;border-radius:5px}.owner{display:flex;flex-direction:column;gap:5px;text-align:center;padding:13px;margin-top:18px;background:#131722;border:1px solid #2a2e39;border-radius:7px;font-size:12px}.owner a{color:#8aa9ff}.owner span{color:#9598a1} .owner-avatar{width:40px;height:40px;margin:0 auto;display:grid;place-items:center;border-radius:50%;background:linear-gradient(135deg,#2962ff,#8d57d6);color:#fff;font-weight:800;box-shadow:0 4px 14px #2962ff55}
+</style></head><body><main><h1>Create account</h1>{% if error %}<p>{{ error }}</p>{% endif %}<form method="post"><input type="hidden" name="csrf_token" value="{{ csrf }}"><label>Username</label><input name="username" minlength="3" maxlength="80" required><label>Password (10 characters minimum)</label><input name="password" type="password" minlength="10" required><button>Create account</button></form><p><a href="{{ url_for('login') }}">Back to sign in</a></p>{{ owner|safe }}</main></body></html>
+"""
+
+ADMIN_HTML = r"""
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="csrf-token" content="{{ csrf }}"><title>Admin · Replay Terminal</title><style>
+*{box-sizing:border-box}body{margin:0;background:#10131c;color:#e5e7ef;font:14px Arial,sans-serif}header{padding:16px 24px;background:#1e222d;border-bottom:1px solid #303644;display:flex;justify-content:space-between}header a{color:#a9baff;text-decoration:none}main{max-width:1200px;margin:28px auto;padding:0 18px}h1{margin-bottom:5px}.sub{color:#969baa;margin:0 0 20px}.table-wrap{overflow:auto;border:1px solid #303644;border-radius:12px;background:#1a1e28}table{width:100%;min-width:940px;border-collapse:collapse}th,td{text-align:left;padding:14px;border-bottom:1px solid #2b303b;vertical-align:middle}th{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#9298a7}tr:last-child td{border-bottom:0}.username{font-size:15px;font-weight:700;color:#fff}.validity{margin-top:5px;color:#9ca3b2;font-size:12px}.grant{display:flex;gap:7px;align-items:center}.grant input{width:82px;padding:9px;background:#11151e;border:1px solid #394150;border-radius:6px;color:#fff}.btn{padding:9px 12px;background:#2962ff;color:#fff;border:0;border-radius:6px;font-weight:700;cursor:pointer;white-space:nowrap}.btn.secondary{background:#343a47}.status{display:inline-block;padding:5px 8px;border-radius:20px;background:#173b33;color:#55d5ae;font-size:11px}.status.off{background:#40242b;color:#ff8890}.password-result{margin-top:10px;min-width:235px;padding:9px;border:1px solid #42506a;background:#111724;border-radius:7px}.password-result small{display:block;color:#f3c66b;margin-bottom:6px}.password-result input{width:100%;padding:8px;background:#080b11;color:#b9d2ff;border:1px solid #30394a;border-radius:5px;font-family:monospace}.note{color:#9ca3b2;font-size:12px;margin:15px 0}.toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);padding:11px 16px;background:#252b37;border:1px solid #485164;border-radius:7px;display:none} @media(max-width:700px){header{padding:13px}main{margin-top:18px}}
+</style></head><body><header><b>Replay Terminal <span style="color:#839fff">· Admin Console</span></b><nav><a href="{{ url_for('home') }}">Terminal</a> &nbsp;·&nbsp; <a href="{{ url_for('logout') }}">Logout</a></nav></header><main><h1>User access & validity</h1><p class="sub">Issue or extend access for each registered username. The username never changes.</p><div class="table-wrap"><table><thead><tr><th>User</th><th>Access</th><th>Validity</th><th>Grant / extend</th><th>Account</th></tr></thead><tbody>{% for u in users %}<tr><td><span class="username">{{ u.username }}</span><div class="validity">ID #{{ u.id }}</div></td><td>{% if u.is_admin %}<span class="status">Administrator</span>{% elif u.valid_until and u.valid_until > now %}<span class="status">Full terminal</span>{% else %}<span class="status off">{{ 'Expired' if u.valid_until else 'Trial only' }}</span>{% endif %}<div id="secret-{{ u.id }}"></div></td><td>{% if u.valid_until %}<span id="validity-{{ u.id }}">{{ validity_labels[u.id] }}</span>{% else %}<span id="validity-{{ u.id }}">No paid access</span>{% endif %}</td><td>{% if not u.is_admin %}<form class="grant" data-user="{{ u.id }}" action="{{ url_for('grant_access',user_id=u.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><label><input name="days" type="number" min="1" max="3650" value="30" aria-label="Validity days"></label><button class="btn">Generate pass + grant</button></form>{% else %}—{% endif %}</td><td>{% if not u.is_admin %}<form method="post" action="{{ url_for('toggle_user',user_id=u.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="btn secondary">{{ 'Block' if u.is_active else 'Activate' }}</button></form>{% else %}<span class="status">Protected</span>{% endif %}</td></tr>{% endfor %}</tbody></table></div><p class="note">Generated passwords are shown once. Copy and share them securely. Reissuing a pass changes the user's password. Validity extends from the later of now or their current expiry.</p></main><div id="toast" class="toast"></div><script>
+const csrf=document.querySelector('meta[name="csrf-token"]').content;function notify(s){const t=document.getElementById('toast');t.textContent=s;t.style.display='block';setTimeout(()=>t.style.display='none',4000)}document.querySelectorAll('.grant').forEach(form=>form.addEventListener('submit',async e=>{e.preventDefault();const button=form.querySelector('button');button.disabled=true;try{const days=Number(form.querySelector('[name="days"]').value);const r=await fetch(form.action,{method:'POST',headers:{'Content-Type':'application/json','X-CSRFToken':csrf},body:JSON.stringify({days})});const d=await r.json();if(!r.ok||d.status!=='success')throw Error(d.message||'Could not issue access');const box=document.getElementById('secret-'+form.dataset.user);box.innerHTML='<div class="password-result"><small>Copy this new password now</small><input readonly value="'+d.password+'"><button type="button" class="btn secondary copy-pass" style="margin-top:6px;width:100%">Copy password</button></div>';box.querySelector('.copy-pass').addEventListener('click',()=>navigator.clipboard.writeText(box.querySelector('input').value).then(()=>notify('Copied')).catch(()=>notify('Copy the password manually')));document.getElementById('validity-'+form.dataset.user).textContent=d.valid_until;notify('Access granted; username unchanged.')}catch(err){notify(err.message)}finally{button.disabled=false}}));
+</script></body></html>
+"""
+
+HTML_PAGE = r"""
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="csrf-token" content="{{ csrf }}"><title>Paper Trading Replay Terminal</title><script src="https://unpkg.com/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.js"></script><style>
+:root{--bg:#131722;--panel:#1e222d;--border:#2a2e39;--text:#d1d4dc;--muted:#787b86}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px Arial;height:100vh;overflow:hidden}.top{height:54px;background:var(--panel);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:0 10px;white-space:nowrap;overflow:auto}.brand{font-weight:bold;color:white}.top select,.top input,.btn{height:31px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:0 8px}.btn{cursor:pointer}.gap{flex:1}.layout{height:calc(100vh - 54px);display:grid;grid-template-columns:44px minmax(0,1fr) 290px}.left{background:var(--panel);border-right:1px solid var(--border);display:flex;align-items:center;flex-direction:column;gap:8px;padding:10px 0}.icon{height:32px;width:32px;background:transparent;color:var(--text);border:1px solid transparent;cursor:pointer}.icon.active,.icon:hover{background:#2a2e39;border-color:#414755}.center{display:flex;flex-direction:column;min-width:0}.quote{height:58px;display:flex;align-items:center;gap:15px;padding:0 12px;border-bottom:1px solid var(--border)}.sym,.price{font-weight:bold;color:white}.price{font-size:18px}.chart{flex:1;min-height:0}.bottom{height:28px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 10px;color:var(--muted);font-size:11px}.right{background:var(--panel);border-left:1px solid var(--border);min-height:0;display:flex;flex-direction:column}.title{padding:15px;border-bottom:1px solid var(--border);font-weight:bold;color:white}.body{padding:12px;overflow:auto;display:flex;flex-direction:column;gap:12px}.card{padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:6px}.inputs{display:grid;grid-template-columns:1fr 1fr;gap:8px}.inputs label{font-size:11px;color:var(--muted)}.inputs input{width:100%;margin-top:4px;padding:8px;background:var(--panel);border:1px solid var(--border);color:white;border-radius:4px}.actions{display:flex;gap:8px;margin-top:10px}.buy,.sell,.square{flex:1;padding:9px;border:0;border-radius:4px;color:white;font-weight:bold;cursor:pointer}.buy{background:#089981}.sell{background:#f23645}.square{background:#dd9226}.row{display:flex;justify-content:space-between;margin:8px 0}.row span{color:var(--muted)}.history{display:flex;flex-direction:column;gap:6px;margin-top:8px}.item{display:flex;justify-content:space-between;padding:8px;background:var(--panel);border-radius:4px;font-size:11px}.green{color:#089981}.red{color:#f23645}.toast{position:fixed;left:50%;bottom:40px;transform:translateX(-50%);display:none;background:#252a36;border:1px solid #454b58;border-radius:6px;padding:10px;z-index:10}.overlay{position:fixed;inset:0;background:#000c;display:none;align-items:center;justify-content:center;z-index:20}.overlaybox{max-width:430px;width:92vw;padding:25px;background:var(--panel);border:1px solid var(--border);border-radius:12px;text-align:center}.owner{display:flex;flex-direction:column;align-items:center;gap:7px;margin-top:15px;padding:15px;border:1px solid var(--border);border-radius:9px;text-align:center}.owner a{color:#9db5ff;text-decoration:none}.owner a:hover{text-decoration:underline}.owner span,.owner-caption{color:var(--muted)}.owner-avatar{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,#2962ff,#8d57d6);color:#fff;font-weight:800;font-size:15px;box-shadow:0 4px 16px #2962ff55}.owner-panel{background:linear-gradient(145deg,#1b2940,#11151e);border-color:#34517d}.owner-title{font-weight:700;color:#f2c66d;margin-bottom:10px}.owner-panel .owner{margin-top:0;background:#0e1420aa;border-color:#354765}.owner-panel .owner b{color:#fff}body.light{--bg:#fff;--panel:#f4f5f8;--border:#e0e3eb;--text:#131722;--muted:#667085}body.light .brand,body.light .sym,body.light .title{color:#131722}body.light .inputs input,body.light .item{background:#fff;color:#131722}@media(max-width:900px){.layout{grid-template-columns:40px minmax(0,1fr)}.right{display:none}}
+</style></head><body><header class="top"><span class="brand">REPLAY TERMINAL</span><select id="symbol"><option value="SENSEX" {% if selected_symbol == 'SENSEX' %}selected{% endif %}>SENSEX</option><option value="NIFTY" {% if selected_symbol == 'NIFTY' %}selected{% endif %}>NIFTY</option><option value="BANKNIFTY" {% if selected_symbol == 'BANKNIFTY' %}selected{% endif %}>BANKNIFTY</option></select><select id="interval"><option value="ONE_MINUTE" {% if selected_interval == 'ONE_MINUTE' %}selected{% endif %}>1m</option><option value="FIVE_MINUTE" {% if selected_interval == 'FIVE_MINUTE' %}selected{% endif %}>5m</option><option value="FIFTEEN_MINUTE" {% if selected_interval == 'FIFTEEN_MINUTE' %}selected{% endif %}>15m</option></select><input id="date" type="date" value="{{ selected_date }}" max="{{ max_date }}"><button class="btn" id="play">⏸ Pause</button><button class="btn" id="step">Step ▸</button><button class="btn" id="reset">↺ Reset</button><select id="speed"><option value="1">1x</option><option value="2">2x</option><option value="5">5x</option><option value="10">10x</option><option value="25">25x</option><option value="50">50x</option></select><button class="btn" id="theme">Day/Night</button><span class="gap"></span><span id="trial">{{ access_label }}</span><span>{{ username }}</span>{% if is_admin %}<a class="btn" href="{{ url_for('admin_panel') }}">Admin</a>{% endif %}<a class="btn" href="{{ url_for('logout') }}">Logout</a></header><div class="layout"><aside class="left"><button class="icon active" title="Crosshair">⌖</button><button class="icon" id="line" title="Horizontal line">―</button><button class="icon" id="fit" title="Fit chart">⤢</button></aside><main class="center"><section class="quote"><span class="sym" id="name">Loading…</span><span class="price" id="ltp">—</span><span id="change">—</span><span id="ohlc">O — H — L — C —</span></section><div id="chart" class="chart"></div><footer class="bottom"><span id="clock">Historical replay</span><span>Original broker OHLC · Paper trading only</span><span>Realized PnL <b id="realized">₹0.00</b></span></footer></main><aside class="right"><div class="title">Paper Trading</div><div class="body"><section class="card"><div class="inputs"><label>Lots<input id="lots" type="number" min="1" max="500" value="1"></label><label>SL points<input id="sl" type="number" min="0" value="20"></label><label>Target points<input id="target" type="number" min="0" value="40"></label><label>Trailing points<input id="trail" type="number" min="0" value="0"></label></div><div class="actions"><button class="sell" id="short">SELL</button><button class="buy" id="long">BUY</button></div></section><section class="card"><b>Open position</b><div id="none" style="color:var(--muted);margin-top:10px">No open position.</div><div id="pos" style="display:none"><div class="row"><span>Instrument</span><b id="psym">—</b></div><div class="row"><span>Side / Qty</span><b id="side">—</b></div><div class="row"><span>Entry</span><b id="entry">—</b></div><div class="row"><span>LTP</span><b id="pltp">—</b></div><div class="row"><span>SL</span><b id="psl">—</b></div><div class="row"><span>Target</span><b id="ptarget">—</b></div><div class="row"><span>Live PnL</span><b id="pnl">—</b></div><button class="square" id="square">Square off</button></div></section><section><b>Closed trades</b><div class="history" id="history">No closed trades.</div></section><section class="card owner-panel"><div class="owner-title">Built by</div>{{ owner|safe }}</section></div></aside></div><div id="toast" class="toast"></div><div id="overlay" class="overlay"><div class="overlaybox"><h2>Free trial ended</h2><p>Your two-minute trial has ended. Contact the owner for access.</p>{{ owner|safe }}<a class="btn" href="{{ url_for('logout') }}">Sign out</a></div></div>
+<script>
+(function(){
+const csrf=document.querySelector('meta[name="csrf-token"]').content,E=id=>document.getElementById(id);let chart,series,bars=[],busy=false,trial={{ trial }},fullAccess={{ 'true' if full_access else 'false' }},draw=false,lines=[];
+async function api(url,opts){opts=opts||{};opts.headers=Object.assign({},opts.headers||{}, {'X-CSRFToken':csrf});if(opts.body&&typeof opts.body==='object'){opts.headers['Content-Type']='application/json';opts.body=JSON.stringify(opts.body)}const r=await fetch(url,opts);let d={};try{d=await r.json()}catch(_){}if(!r.ok||d.status==='error')throw Error(d.message||('Request failed ('+r.status+')'));return d}
+function toast(s){const t=E('toast');t.textContent=s;t.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.style.display='none',3500)}function f(n){return Number(n||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}function safe(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function initChart(){const box=E('chart');chart=LightweightCharts.createChart(box,{width:box.clientWidth,height:box.clientHeight,layout:{background:{color:'#131722'},textColor:'#d1d4dc',fontSize:12},grid:{vertLines:{color:'#252a36'},horzLines:{color:'#252a36'}},timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#2a2e39',rightOffset:6},rightPriceScale:{borderColor:'#2a2e39'},crosshair:{mode:LightweightCharts.CrosshairMode.Normal}});series=chart.addCandlestickSeries({upColor:'#089981',downColor:'#f23645',borderVisible:false,wickUpColor:'#089981',wickDownColor:'#f23645'});window.addEventListener('resize',()=>chart.applyOptions({width:box.clientWidth,height:box.clientHeight}));chart.subscribeClick(p=>{if(draw&&p.point){let price=series.coordinateToPrice(p.point.y);if(price)series.createPriceLine({price,color:'#2962ff',lineStyle:LightweightCharts.LineStyle.Dashed,title:'S/R',axisLabelVisible:true});draw=false;E('line').classList.remove('active')}})}
+function drawPosition(t){lines.forEach(x=>series.removePriceLine(x));lines=[];if(!t||!t.position)return;lines.push(series.createPriceLine({price:t.entry_price,color:'#2962ff',lineWidth:2,title:'ENTRY'}));if(t.sl_price>0)lines.push(series.createPriceLine({price:t.sl_price,color:'#f23645',lineStyle:2,title:'SL'}));if(t.target_price>0)lines.push(series.createPriceLine({price:t.target_price,color:'#089981',lineStyle:2,title:'TARGET'}))}
+function render(d){const c=d.current_candle;if(d.history&&d.history.length){bars=d.history;series.setData(bars)}if(c){series.update(c);if(bars.length&&bars[bars.length-1].time===c.time)bars[bars.length-1]=c;else bars.push(c);E('name').textContent=d.symbol+' · '+d.interval_label+' · '+d.exchange;E('ltp').textContent=f(c.close);E('change').textContent=d.change_str;E('ohlc').textContent='O '+f(c.open)+' H '+f(c.high)+' L '+f(c.low)+' C '+f(c.close);E('clock').textContent=d.synced_time_str}
+E('realized').textContent=(d.realized_pnl>=0?'+₹':'−₹')+f(Math.abs(d.realized_pnl));E('play').textContent=d.is_playing?'⏸ Pause':'▶ Play';const t=d.trade_info,open=!!(t&&t.position);E('none').style.display=open?'none':'block';E('pos').style.display=open?'block':'none';if(open&&c){E('psym').textContent=t.label;E('side').textContent=t.position+' / '+t.qty;E('entry').textContent=f(t.entry_price);E('pltp').textContent=f(c.close);E('psl').textContent=t.sl_price?f(t.sl_price):'—';E('ptarget').textContent=t.target_price?f(t.target_price):'—';E('pnl').textContent=(t.pnl>=0?'+₹':'−₹')+f(Math.abs(t.pnl));drawPosition(t)}else drawPosition(null);if(!d.trade_history||!d.trade_history.length)E('history').textContent='No closed trades.';else E('history').innerHTML=d.trade_history.slice(0,30).map(x=>'<div class="item"><span><b>'+safe(x.symbol)+'</b> '+safe(x.type)+'<br>'+safe(x.reason)+' · '+f(x.entry)+' → '+f(x.exit)+'</span><b class="'+(x.pnl>=0?'green':'red')+'">'+(x.pnl>=0?'+':'−')+'₹'+f(Math.abs(x.pnl))+'</b></div>').join('');if(t&&t.auto_closed)toast('Closed: '+t.reason+' · PnL ₹'+f(t.pnl))}
+async function tick(){if(busy||trial<=0)return;busy=true;try{render(await api('/api/get_tick'))}catch(e){E('name').textContent='Data unavailable';if(e.message.indexOf('Access expired')===0){trial=0;E('overlay').style.display='flex'}toast(e.message)}finally{busy=false}}
+async function doRun(fn){try{await fn();await tick()}catch(e){toast(e.message)}}async function change(url,data){bars=[];series.setData([]);await api(url,{method:'POST',body:data||{}});await tick()}
+E('symbol').addEventListener('change',()=>doRun(()=>change('/api/change_symbol',{symbol:E('symbol').value})));E('interval').addEventListener('change',()=>doRun(()=>change('/api/set_interval',{interval:E('interval').value})));E('date').addEventListener('change',()=>doRun(()=>change('/api/set_date',{date:E('date').value})));E('speed').addEventListener('change',()=>doRun(()=>api('/api/set_speed',{method:'POST',body:{speed:Number(E('speed').value)}})));E('play').addEventListener('click',()=>doRun(()=>api('/api/toggle_play',{method:'POST',body:{}})));E('step').addEventListener('click',()=>doRun(()=>api('/api/step_candle',{method:'POST',body:{}})));E('reset').addEventListener('click',()=>doRun(()=>change('/api/reset_sim',{})));E('fit').addEventListener('click',()=>chart.timeScale().fitContent());E('line').addEventListener('click',()=>{draw=!draw;E('line').classList.toggle('active',draw)});
+E('theme').addEventListener('click',()=>{document.body.classList.toggle('light');const l=document.body.classList.contains('light');chart.applyOptions({layout:{background:{color:l?'#fff':'#131722'},textColor:l?'#131722':'#d1d4dc'}})});
+async function order(side){await doRun(()=>api('/api/trade',{method:'POST',body:{action:side,lots:Number(E('lots').value),sl_points:Number(E('sl').value),target_points:Number(E('target').value),tsl_points:Number(E('trail').value)}}))}E('long').addEventListener('click',()=>order('LONG'));E('short').addEventListener('click',()=>order('SHORT'));E('square').addEventListener('click',()=>doRun(()=>api('/api/close_trade',{method:'POST',body:{}})));
+if(!fullAccess)setInterval(()=>{if(trial>0){trial--;E('trial').textContent='Trial '+Math.floor(trial/60)+':'+String(trial%60).padStart(2,'0')}if(trial<=0){E('overlay').style.display='flex';E('trial').textContent='Trial ended'}},1000);initChart();tick();setInterval(tick,100)
+})();
+</script></body></html>
+"""
+
+
+@app.route("/")
 def index():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    if session.get('is_admin'): return redirect(url_for('admin_panel'))
-    return redirect(url_for('home'))
+    return redirect(url_for("home" if session.get("user_id") else "login"))
 
-@app.route('/login', methods=['GET', 'POST'])
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        user = User.query.filter_by(username=username).first()
-        if user and check_password_hash(user.password, password):
-            if not user.is_active:
-                return render_template_string(LOGIN_HTML, error="Account blocked by Admin.", owner=OWNER_HTML)
-            session['user_id'] = user.id
-            session['username'] = user.username
-            session['is_admin'] = user.is_admin
-            session['login_time'] = datetime.now().timestamp()
-            if user.is_admin: return redirect(url_for('admin_panel'))
-            return redirect(url_for('home'))
-        return render_template_string(LOGIN_HTML, error="Invalid Credentials", owner=OWNER_HTML)
-    return render_template_string(LOGIN_HTML, error=None, owner=OWNER_HTML)
+    if request.method == "POST":
+        name, password = (request.form.get("username") or "").strip(), request.form.get("password") or ""
+        user = db.session.execute(db.select(User).filter_by(username=name)).scalar_one_or_none()
+        if user and user.is_active and check_password_hash(user.password, password):
+            session.clear(); session.permanent = True
+            if not has_full_access(user) and user.trial_started_at is None:
+                user.trial_started_at = time.time()
+                db.session.commit()
+            session.update(user_id=user.id, username=user.username, is_admin=bool(user.is_admin), auth_version=user.auth_version)
+            csrf_token()
+            return redirect(url_for("admin_panel" if user.is_admin else "home"))
+        msg = "Invalid username or password." if user is None or user.is_active else "This account is blocked."
+        return render_template_string(LOGIN_HTML, error=msg, csrf=csrf_token(), owner=OWNER_INFO_HTML), 401
+    return render_template_string(LOGIN_HTML, error=None, csrf=csrf_token(), owner=OWNER_INFO_HTML)
 
-@app.route('/register', methods=['GET', 'POST'])
+
+@app.route("/register", methods=["GET", "POST"])
 def register():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        if User.query.filter_by(username=username).first():
-            return render_template_string(REGISTER_HTML, error="Username exists", owner=OWNER_HTML)
-        new_user = User(username=username, password=generate_password_hash(password))
-        db.session.add(new_user)
-        db.session.commit()
-        return redirect(url_for('login'))
-    return render_template_string(REGISTER_HTML, error=None, owner=OWNER_HTML)
+    if request.method == "POST":
+        name, password = (request.form.get("username") or "").strip(), request.form.get("password") or ""
+        if not (3 <= len(name) <= 80) or not name.replace("_", "").replace("-", "").isalnum():
+            return render_template_string(REGISTER_HTML, error="Username must be 3–80 letters, numbers, _ or -.", csrf=csrf_token(), owner=OWNER_INFO_HTML), 400
+        if len(password) < 10:
+            return render_template_string(REGISTER_HTML, error="Password must be at least 10 characters.", csrf=csrf_token(), owner=OWNER_INFO_HTML), 400
+        if db.session.execute(db.select(User).filter_by(username=name)).scalar_one_or_none():
+            return render_template_string(REGISTER_HTML, error="That username is already taken.", csrf=csrf_token(), owner=OWNER_INFO_HTML), 409
+        new_user = User(username=name, password=generate_password_hash(password), is_admin=False, is_active=True)
+        db.session.add(new_user); db.session.commit(); get_state(new_user.id)
+        return redirect(url_for("login"))
+    return render_template_string(REGISTER_HTML, error=None, csrf=csrf_token(), owner=OWNER_INFO_HTML)
 
-@app.route('/logout')
+
+@app.route("/logout")
 def logout():
-    session.clear()
-    return redirect(url_for('login'))
+    session.clear(); return redirect(url_for("login"))
 
-@app.route('/admin')
+
+@app.route("/admin")
+@admin_required
 def admin_panel():
-    if not session.get('is_admin'): return redirect(url_for('login'))
-    users = User.query.all()
-    return render_template_string(ADMIN_HTML, users=users)
+    users = db.session.execute(db.select(User).order_by(User.id)).scalars().all()
+    labels = {
+        user.id: datetime.fromtimestamp(user.valid_until, IST).strftime("%d %b %Y, %I:%M %p IST")
+        for user in users if user.valid_until is not None
+    }
+    return render_template_string(ADMIN_HTML, users=users, csrf=csrf_token(), validity_labels=labels, now=time.time())
 
-@app.route('/admin/toggle/<int:user_id>')
-def toggle_user(user_id):
-    if session.get('is_admin'):
-        user = User.query.get(user_id)
-        if user: user.is_active = not user.is_active; db.session.commit()
-    return redirect(url_for('admin_panel'))
 
-# --- TERMINAL ROUTE ---
-@app.route('/terminal')
-def home():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    if not user or not user.is_active: session.clear(); return redirect(url_for('login'))
-    
-    if user.is_admin:
-        return render_template_string(HTML_PAGE, trial=999999, username=session['username'])
-        
-    trial_remaining = max(0, 120 - int(time.time() - session.get('login_time', time.time())))
-    return render_template_string(HTML_PAGE, trial=trial_remaining, username=session['username'])
+@app.route("/admin/grant/<int:user_id>", methods=["POST"])
+@admin_required
+def grant_access(user_id):
+    user = db.session.get(User, user_id)
+    if user is None or user.is_admin:
+        return jsonify(status="error", message="This account cannot receive a standard user pass."), 404
+    try:
+        days = int((request.get_json(silent=True) or {}).get("days", 0))
+    except (TypeError, ValueError):
+        return jsonify(status="error", message="Enter a valid number of days."), 400
+    if not 1 <= days <= 3650:
+        return jsonify(status="error", message="Validity must be between 1 and 3650 days."), 400
 
-# --- API ROUTES ---
-@app.route('/api/change_symbol/<symbol>')
-def change_symbol(symbol):
-    global current_symbol, real_data, current_candle_index, candle_progress, needs_history_reload, is_playing, smooth_price, current_high, current_low
-    if symbol in INDICES:
-        if position is not None and last_ltp > 0: execute_square_off(last_ltp, reason="Symbol Switch")
-        current_symbol = symbol
-        real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True
-        is_playing = True; smooth_price = 0.0; current_high = 0.0; current_low = 0.0
-        return jsonify({"status": "success"})
-    return jsonify({"status": "error"})
-
-@app.route('/api/set_interval/<interval>')
-def set_interval(interval):
-    global current_interval, real_data, current_candle_index, candle_progress, needs_history_reload, is_playing, smooth_price, current_high, current_low
-    current_interval = interval
-    real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True
-    is_playing = True; smooth_price = 0.0; current_high = 0.0; current_low = 0.0
-    return jsonify({"status": "success"})
-
-@app.route('/api/set_speed/<int:speed>')
-def set_speed(speed):
-    global playback_speed, last_real_time
-    playback_speed = speed; last_real_time = time.time()
-    return jsonify({"status": "success", "speed": playback_speed})
-
-@app.route('/api/set_date')
-def set_date():
-    global selected_date, real_data, current_candle_index, candle_progress, needs_history_reload, last_real_time, is_playing, smooth_price, current_high, current_low
-    selected_date = request.args.get('date')
-    
-    # Data Reset
-    real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True
-    last_real_time = time.time()
-    
-    # 🔥 PLAY BUG FIX 🔥
-    is_playing = True 
-    smooth_price = 0.0
-    current_high = 0.0
-    current_low = 0.0
-    
-    return jsonify({"status": "success", "selected_date": selected_date})
-
-@app.route('/api/toggle_play', methods=['POST'])
-def toggle_play():
-    global is_playing, last_real_time
-    is_playing = not is_playing; last_real_time = time.time()
-    return jsonify({"status": "success", "is_playing": is_playing})
-
-@app.route('/api/step_candle', methods=['POST'])
-def step_candle():
-    global current_candle_index, candle_progress, last_real_time
-    if len(real_data) > 0 and current_candle_index < len(real_data) - 1:
-        current_candle_index += 1
-        candle_progress = 0.0
-        reset_candle_bounds()
-        last_real_time = time.time()
-    return jsonify({"status": "success"})
-
-@app.route('/api/reset_sim', methods=['POST'])
-def reset_sim():
-    global current_candle_index, candle_progress, needs_history_reload, last_real_time, is_playing
-    if position is not None and last_ltp > 0: execute_square_off(last_ltp, reason="Day Reset")
-    current_candle_index = 0; candle_progress = 0.0; is_playing = True
-    reset_candle_bounds(); needs_history_reload = True; last_real_time = time.time()
-    return jsonify({"status": "success", "selected_date": selected_date})
-
-@app.route('/api/get_tick')
-def get_tick():
-    global real_data, current_candle_index, candle_progress, last_real_time, is_playing, playback_speed
-    global position, instrument_label, entry_price, sl_price, target_price, tsl_points, highest_price, lowest_price, qty_lots, pnl, realized_pnl, last_ltp
-    global current_symbol, selected_date, current_interval, needs_history_reload, session_initialized
-    global smooth_price, current_high, current_low
-
-    if len(real_data) == 0:
-        try:
-            ensure_login()
-            idx = INDICES[current_symbol]
-            params = {
-                "exchange": idx["exchange"], "symboltoken": idx["token"], "interval": current_interval,
-                "fromdate": f"{selected_date} 09:15", "todate": f"{selected_date} 15:30"
-            }
-            response = obj.getCandleData(params)
-            if response and response.get('status') and response.get('data'):
-                real_data = response['data']
-                current_candle_index = 0; candle_progress = 0.0
-                reset_candle_bounds(); needs_history_reload = True; last_real_time = time.time()
-            else:
-                session_initialized = False
-                return jsonify({"status": "error", "message": "No data found."})
-        except Exception as e:
-            session_initialized = False
-            return jsonify({"status": "error", "message": str(e)})
-
-    if len(real_data) == 0: return jsonify({"status": "error"})
-    if current_candle_index >= len(real_data):
-        current_candle_index = len(real_data) - 1
-        is_playing = False
-
+    # Issue a strong one-time password; only its hash is stored in the database.
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    generated_password = "".join(secrets.choice(alphabet) for _ in range(20))
     now = time.time()
-    if is_playing:
-        # 300 Seconds Divisor
-        candle_progress += ((now - last_real_time) / 300.0) * playback_speed
-        last_real_time = now
-        if candle_progress >= 1.0:
-            candle_progress = 0.0
-            if current_candle_index < len(real_data) - 1:
-                current_candle_index += 1
-                reset_candle_bounds()
-            else:
-                is_playing = False
+    start = max(now, user.valid_until or 0.0)
+    user.password = generate_password_hash(generated_password)
+    user.valid_until = start + days * 86400
+    user.auth_version += 1
+    if user.trial_started_at is None:
+        user.trial_started_at = now - TRIAL_SECONDS
+    db.session.commit()
+    return jsonify(
+        status="success",
+        password=generated_password,
+        valid_until=datetime.fromtimestamp(user.valid_until, IST).strftime("%d %b %Y, %I:%M %p IST"),
+    )
+
+
+@app.route("/admin/toggle/<int:user_id>", methods=["POST"])
+@admin_required
+def toggle_user(user_id):
+    user = db.session.get(User, user_id)
+    if user and not user.is_admin:
+        user.is_active = not user.is_active; db.session.commit()
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/terminal")
+@login_required
+def home():
+    user = db.session.get(User, session["user_id"]); state = get_state(user.id)
+    full_access = has_full_access(user)
+    if user.is_admin:
+        access_label = "Administrator · unlimited access"
+    elif full_access:
+        access_label = "Full access until " + datetime.fromtimestamp(user.valid_until, IST).strftime("%d %b %Y")
     else:
-        last_real_time = now
+        left = trial_left(user)
+        access_label = "Trial " + str(left // 60) + ":" + str(left % 60).zfill(2)
+    return render_template_string(HTML_PAGE, username=user.username, is_admin=user.is_admin,
+        full_access=full_access, trial=999999 if full_access else trial_left(user), access_label=access_label,
+        selected_date=state.selected_date, selected_symbol=state.symbol, selected_interval=state.interval,
+        max_date=datetime.now(IST).date().isoformat(), csrf=csrf_token(), owner=OWNER_INFO_HTML)
 
-    history_payload = []
-    if needs_history_reload:
-        history_payload = [format_candle(row) for row in real_data[:current_candle_index]]
-        needs_history_reload = False
 
-    c = real_data[current_candle_index]
-    open_p, high_p, low_p, close_p = float(c[1]), float(c[2]), float(c[3]), float(c[4])
+def current_user_state():
+    user = db.session.get(User, session["user_id"])
+    query = db.select(TradingState).filter_by(user_id=user.id).with_for_update()
+    state = db.session.execute(query).scalar_one_or_none()
+    if state is None:
+        state = get_state(user.id)
+    return user, state
 
-    # Smooth Tick Logic
-    if candle_progress < 0.35:
-        target_p = low_p if close_p >= open_p else high_p
-        guide_p = open_p + (target_p - open_p) * (candle_progress / 0.35)
-    elif candle_progress < 0.75:
-        start_p = low_p if close_p >= open_p else high_p
-        target_p = high_p if close_p >= open_p else low_p
-        guide_p = start_p + (target_p - start_p) * ((candle_progress - 0.35) / 0.40)
-    else:
-        start_p = high_p if close_p >= open_p else low_p
-        guide_p = start_p + (close_p - start_p) * min((candle_progress - 0.75) / 0.25, 1.0)
 
-    if smooth_price == 0.0: smooth_price = open_p
-    
-    # Tight Micro-Noise
-    micro_noise = random.uniform(-0.05, 0.05) * max(1.0, (high_p - low_p) * 0.01)
-    
-    smooth_price = smooth_price + (guide_p - smooth_price) * 0.15 + micro_noise
-    current_price = round(max(low_p, min(high_p, smooth_price)), 2)
+@app.route("/api/change_symbol", methods=["POST"])
+@login_required
+def change_symbol():
+    symbol = (request.get_json(silent=True) or {}).get("symbol")
+    if symbol not in INDICES: return jsonify(status="error", message="Unsupported index."), 400
+    user, s = current_user_state()
+    with state_lock:
+        rows = rows_of(s)
+        if s.position and s.last_ltp > 0: closed_trades(s, "Symbol switch")
+        s.symbol=symbol; s.real_data_json="[]"; s.candle_index=0; s.candle_progress=0
+        s.is_playing=True; s.needs_history_reload=True; s.smooth_price=s.current_high=s.current_low=0
+        s.last_tick_at=time.time(); db.session.commit()
+    return jsonify(status="success")
 
-    if candle_progress > 0.94:
-        current_price = close_p; current_high = high_p; current_low = low_p
-    else:
-        current_high = round(max(current_high, open_p, current_price), 2)
-        current_low = round(min(current_low, open_p, current_price), 2)
 
-    last_ltp = current_price
+@app.route("/api/set_interval", methods=["POST"])
+@login_required
+def set_interval():
+    interval=(request.get_json(silent=True) or {}).get("interval")
+    if interval not in INTERVALS: return jsonify(status="error", message="Unsupported timeframe."), 400
+    user,s=current_user_state(); s.interval=interval; s.real_data_json="[]"; s.candle_index=0; s.candle_progress=0
+    s.is_playing=True; s.needs_history_reload=True; s.smooth_price=s.current_high=s.current_low=0; s.last_tick_at=time.time(); db.session.commit()
+    return jsonify(status="success")
 
-    if position == 'LONG':
-        if current_price > highest_price:
-            highest_price = current_price
-            if tsl_points > 0:
-                new_tsl = highest_price - tsl_points
-                if new_tsl > sl_price: sl_price = round(new_tsl, 2)
-    elif position == 'SHORT':
-        if current_price < lowest_price or lowest_price == 0:
-            lowest_price = current_price
-            if tsl_points > 0:
-                new_tsl = lowest_price + tsl_points
-                if new_tsl < sl_price or sl_price == 0: sl_price = round(new_tsl, 2)
 
-    trade_info = None
-    if position == 'LONG':
-        if sl_price > 0 and current_price <= sl_price:
-            closed_pnl = execute_square_off(sl_price, reason="Stop Loss / TSL")
-            trade_info = {"auto_closed": True, "reason": "Stop Loss / TSL", "pnl": closed_pnl}
-        elif target_price > 0 and current_price >= target_price:
-            closed_pnl = execute_square_off(target_price, reason="Target")
-            trade_info = {"auto_closed": True, "reason": "Target", "pnl": closed_pnl}
-    elif position == 'SHORT':
-        if sl_price > 0 and current_price >= sl_price:
-            closed_pnl = execute_square_off(sl_price, reason="Stop Loss / TSL")
-            trade_info = {"auto_closed": True, "reason": "Stop Loss / TSL", "pnl": closed_pnl}
-        elif target_price > 0 and current_price <= target_price:
-            closed_pnl = execute_square_off(target_price, reason="Target")
-            trade_info = {"auto_closed": True, "reason": "Target", "pnl": closed_pnl}
+@app.route("/api/set_date", methods=["POST"])
+@login_required
+def set_date():
+    try:
+        day=date.fromisoformat(str((request.get_json(silent=True) or {}).get("date", "")))
+        if day>datetime.now(IST).date(): raise ValueError
+    except ValueError: return jsonify(status="error", message="Choose a valid date up to today."),400
+    user,s=current_user_state()
+    if s.position and s.last_ltp>0: closed_trades(s, "Date change")
+    s.selected_date=day.isoformat(); s.real_data_json="[]"; s.candle_index=0; s.candle_progress=0
+    s.is_playing=True; s.smooth_price=s.current_high=s.current_low=0; s.needs_history_reload=True; s.last_tick_at=time.time(); s.last_ltp=0
+    db.session.commit(); return jsonify(status="success",selected_date=s.selected_date,is_playing=True)
 
-    if position is not None and trade_info is None:
-        lot_size = INDICES[current_symbol]["lot"]
-        total_qty = lot_size * qty_lots
-        pnl = (current_price - entry_price) * total_qty if position == 'LONG' else (entry_price - current_price) * total_qty
-        trade_info = {
-            "auto_closed": False, "position": position, "label": instrument_label, "qty": total_qty,
-            "entry_price": entry_price, "sl_price": sl_price, "target_price": target_price, "pnl": round(pnl, 2)
-        }
 
-    candle_dt = datetime.fromisoformat(c[0])
-    interval_seconds_map = {"ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900, "ONE_HOUR": 3600}
-    total_sec = interval_seconds_map.get(current_interval, 300)
-    elapsed_sec = int(min(candle_progress, 0.99) * total_sec)
-    sim_dt = datetime.fromtimestamp(candle_dt.timestamp() + elapsed_sec)
-    synced_time_str = f"{sim_dt.strftime('%d %b %Y  %H:%M:%S')} UTC+5:30"
+@app.route("/api/set_speed", methods=["POST"])
+@login_required
+def set_speed():
+    try: speed=int((request.get_json(silent=True) or {}).get("speed",1))
+    except (TypeError,ValueError): return jsonify(status="error",message="Invalid speed."),400
+    if speed not in SPEEDS: return jsonify(status="error",message="Unsupported replay speed."),400
+    user,s=current_user_state(); s.playback_speed=speed; s.last_tick_at=time.time(); db.session.commit()
+    return jsonify(status="success",speed=speed)
 
-    current_candle = {
-        "time": int(candle_dt.timestamp()) + 19800,
-        "open": open_p, "high": current_high, "low": current_low, "close": current_price
-    }
 
-    interval_map = {"ONE_MINUTE": "1", "FIVE_MINUTE": "5", "FIFTEEN_MINUTE": "15", "ONE_HOUR": "60"}
-    interval_name = interval_map.get(current_interval, "5")
-    exchange_name = INDICES[current_symbol]["exchange"]
+@app.route("/api/toggle_play", methods=["POST"])
+@login_required
+def toggle_play():
+    user,s=current_user_state(); s.is_playing=not s.is_playing; s.last_tick_at=time.time(); db.session.commit()
+    return jsonify(status="success",is_playing=s.is_playing)
 
-    day_open = float(real_data[0][1])
-    change_val = current_price - day_open
-    change_pct = (change_val / day_open) * 100 if day_open != 0 else 0
-    change_str = f"{'+' if change_val >= 0 else ''}{change_val:.2f} ({change_pct:.2f}%)"
 
-    return jsonify({
-        "status": "success", "is_playing": is_playing, "current_candle": current_candle,
-        "history": history_payload, "trade_info": trade_info, "realized_pnl": realized_pnl,
-        "trade_history": trade_history, "symbol": INDICES[current_symbol]["name"],
-        "step_size": INDICES[current_symbol]["step"], "interval_name": interval_name,
-        "exchange": exchange_name, "change_str": change_str, "selected_date": selected_date,
-        "synced_time_str": synced_time_str
-    })
+@app.route("/api/step_candle", methods=["POST"])
+@login_required
+def step_candle():
+    user,s=current_user_state(); rows=rows_of(s)
+    if rows and s.candle_index<len(rows)-1:
+        s.candle_index+=1; s.candle_progress=0; reset_bounds(s,rows); s.last_tick_at=time.time()
+    db.session.commit(); return jsonify(status="success")
 
-@app.route('/api/trade', methods=['POST'])
+
+@app.route("/api/reset_sim", methods=["POST"])
+@login_required
+def reset_sim():
+    user,s=current_user_state()
+    if s.position and s.last_ltp>0: closed_trades(s, "Simulation reset")
+    s.candle_index=0; s.candle_progress=0; s.is_playing=True; s.needs_history_reload=True
+    s.smooth_price=s.current_high=s.current_low=0; s.last_tick_at=time.time(); db.session.commit()
+    return jsonify(status="success")
+
+
+@app.route("/api/trade", methods=["POST"])
+@login_required
 def trade():
-    global position, instrument_label, entry_price, sl_price, target_price, tsl_points, highest_price, lowest_price, qty_lots, last_ltp
-    data = request.get_json() or {}
-    action = data.get('action')
-    lots = int(data.get('lots', 1))
-    sl_points = float(data.get('sl_points', 20))
-    target_points = float(data.get('target_points', 40))
-    tsl_points = float(data.get('tsl_points', 0))
-    custom_label = data.get('label')
+    d=request.get_json(silent=True) or {}; action=d.get("action")
+    try: lots=int(d.get("lots",1)); sl=float(d.get("sl_points",20)); target=float(d.get("target_points",40)); trail=float(d.get("tsl_points",0))
+    except (TypeError,ValueError): return jsonify(status="error",message="Trade inputs must be numbers."),400
+    if action not in {"LONG","SHORT"} or not 1<=lots<=500 or any(not 0<=x<=100000 for x in (sl,target,trail)):
+        return jsonify(status="error",message="Invalid trade input."),400
+    user,s=current_user_state()
+    if not rows_of(s) or s.last_ltp<=0: return jsonify(status="error",message="Historical candles are still loading."),409
+    if s.position: return jsonify(status="error",message="One paper position is already open."),409
+    s.position=action;s.position_label=s.symbol;s.lots=lots;s.entry_price=round(s.last_ltp,2);s.highest_price=s.lowest_price=s.entry_price;s.trailing_points=trail
+    s.stop_loss=round(s.entry_price-sl,2) if action=="LONG" and sl else round(s.entry_price+sl,2) if sl else 0
+    s.target_price=round(s.entry_price+target,2) if action=="LONG" and target else round(s.entry_price-target,2) if target else 0
+    db.session.commit();return jsonify(status="success")
 
-    if len(real_data) == 0 or last_ltp == 0:
-        return jsonify({"status": "error", "message": "Market data loading..."})
-    if position is not None:
-        return jsonify({"status": "error", "message": "Position already open!"})
 
-    position = action
-    instrument_label = custom_label if custom_label else INDICES[current_symbol]["name"]
-    qty_lots = max(1, lots)
-    entry_price = round(last_ltp, 2)
-    highest_price = entry_price; lowest_price = entry_price
-
-    if action == 'LONG':
-        sl_price = round(entry_price - sl_points, 2) if sl_points > 0 else 0.0
-        target_price = round(entry_price + target_points, 2) if target_points > 0 else 0.0
-    else:
-        sl_price = round(entry_price + sl_points, 2) if sl_points > 0 else 0.0
-        target_price = round(entry_price - target_points, 2) if target_points > 0 else 0.0
-
-    lot_size = INDICES[current_symbol]["lot"]
-    trade_info = {
-        "position": position, "label": instrument_label, "qty": lot_size * qty_lots,
-        "entry_price": entry_price, "sl_price": sl_price, "target_price": target_price, "pnl": 0.0
-    }
-    return jsonify({"status": "success", "trade_info": trade_info})
-
-@app.route('/api/close_trade', methods=['POST'])
+@app.route("/api/close_trade", methods=["POST"])
+@login_required
 def close_trade():
-    if position is None:
-        return jsonify({"status": "error", "message": "No open position"})
-    final_pnl = execute_square_off(last_ltp, reason="Manual")
-    return jsonify({"status": "success", "final_pnl": final_pnl})
+    user,s=current_user_state()
+    if not s.position:return jsonify(status="error",message="No open position."),409
+    pnl=closed_trades(s);db.session.commit();return jsonify(status="success",final_pnl=pnl)
 
-# --- HTML TEMPLATES ---
-LOGIN_HTML = f"""
-<!DOCTYPE html><html><head><title>Login</title>
-<style>body{{background:#131722;color:white;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}}.box{{background:#1e222d;padding:40px;border-radius:10px;width:350px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);}}h2{{margin-top:0;color:#2962ff;}}input{{width:100%;padding:10px;margin:10px 0;background:#131722;border:1px solid #2a2e39;color:white;border-radius:5px;box-sizing:border-box;}}button{{width:100%;padding:10px;background:#2962ff;color:white;border:none;border-radius:5px;cursor:pointer;font-weight:bold;margin-top:10px;}}.error{{color:#ef5350;margin-bottom:10px;}}</style></head>
-<body><div class="box"><h2>Login</h2>{{% if error %}}<div class="error">{{{{ error }}}}</div>{{% endif %}}
-<form method="POST"><input type="text" name="username" placeholder="Username" required><input type="password" name="password" placeholder="Password" required><button type="submit">Login</button></form>
-<div style="margin-top:15px; font-size:12px;"><a href="/register" style="color:#2962ff;">Create Account</a></div>
-{OWNER_HTML}
-</div></body></html>
-"""
 
-REGISTER_HTML = f"""
-<!DOCTYPE html><html><head><title>Register</title>
-<style>body{{background:#131722;color:white;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}}.box{{background:#1e222d;padding:40px;border-radius:10px;width:350px;text-align:center;}}h2{{margin-top:0;color:#089981;}}input{{width:100%;padding:10px;margin:10px 0;background:#131722;border:1px solid #2a2e39;color:white;border-radius:5px;box-sizing:border-box;}}button{{width:100%;padding:10px;background:#089981;color:white;border:none;border-radius:5px;cursor:pointer;font-weight:bold;}}.error{{color:#ef5350;margin-bottom:10px;}}</style></head>
-<body><div class="box"><h2>Register</h2>{{% if error %}}<div class="error">{{{{ error }}}}</div>{{% endif %}}
-<form method="POST"><input type="text" name="username" placeholder="Username" required><input type="password" name="password" placeholder="Password" required><button type="submit">Register</button></form>
-<div style="margin-top:15px; font-size:12px;"><a href="/login" style="color:#2962ff;">Login</a></div>
-{OWNER_HTML}
-</div></body></html>
-"""
+@app.route("/api/get_tick")
+@login_required
+def get_tick():
+    user,s=current_user_state()
+    with state_lock:
+        rows=rows_of(s)
+        if not rows:
+            try: rows=fetch_candles(s.symbol,s.interval,s.selected_date)
+            except ValueError as e:return jsonify(status="error",message=str(e)),409
+            except Exception as e:
+                log.exception("Historical candle load failed")
+                return jsonify(status="error",message=str(e)),503
+            if not rows:return jsonify(status="error",message="No candles for this date (holiday, weekend, or broker data limit)."),404
+            s.real_data_json=json.dumps(rows,separators=(",",":"));s.candle_index=0;s.candle_progress=0;s.needs_history_reload=True;s.last_tick_at=time.time();reset_bounds(s,rows)
+        s.candle_index=min(max(s.candle_index,0),len(rows)-1);now=time.time()
+        if s.is_playing:
+            s.candle_progress+=max(0,now-(s.last_tick_at or now))/300.0*s.playback_speed
+            while s.candle_progress>=1 and s.candle_index<len(rows)-1:
+                s.candle_progress-=1;s.candle_index+=1;reset_bounds(s,rows)
+            if s.candle_index==len(rows)-1 and s.candle_progress>=1:s.candle_progress=1;s.is_playing=False
+        s.last_tick_at=now
+        history=[]
+        if s.needs_history_reload:history=[chart_candle(r) for r in rows[:s.candle_index]];s.needs_history_reload=False
+        c=rows[s.candle_index];op,hi,lo,cl=map(float,c[1:5]);p=min(max(s.candle_progress,0),1)
+        if p<.35:
+            target=lo if cl>=op else hi;guide=op+(target-op)*(p/.35)
+        elif p<.75:
+            start=lo if cl>=op else hi;target=hi if cl>=op else lo;guide=start+(target-start)*((p-.35)/.40)
+        else:
+            start=hi if cl>=op else lo;guide=start+(cl-start)*min((p-.75)/.25,1)
+        if s.smooth_price==0:s.smooth_price=op
+        noise=random.uniform(-.05,.05)*max(1,(hi-lo)*.01)
+        s.smooth_price+=(guide-s.smooth_price)*.15+noise
+        price=round(max(lo,min(hi,s.smooth_price)),2)
+        if p>.94:price=cl;s.current_high=hi;s.current_low=lo
+        else:s.current_high=round(max(s.current_high,op,price),2);s.current_low=round(min(s.current_low,op,price),2)
+        s.last_ltp=price
+        if s.position=="LONG" and price>s.highest_price:
+            s.highest_price=price
+            if s.trailing_points>0:s.stop_loss=max(s.stop_loss,round(s.highest_price-s.trailing_points,2))
+        elif s.position=="SHORT" and (price<s.lowest_price or s.lowest_price==0):
+            s.lowest_price=price
+            if s.trailing_points>0:
+                candidate=round(s.lowest_price+s.trailing_points,2);s.stop_loss=min(s.stop_loss,candidate) if s.stop_loss else candidate
+        ti=None
+        if s.position=="LONG":
+            if s.stop_loss>0 and price<=s.stop_loss: result=closed_trades(s);ti={"auto_closed":True,"reason":"Stop loss / trailing stop","pnl":result}
+            elif s.target_price>0 and price>=s.target_price: result=closed_trades(s);ti={"auto_closed":True,"reason":"Target","pnl":result}
+        elif s.position=="SHORT":
+            if s.stop_loss>0 and price>=s.stop_loss: result=closed_trades(s);ti={"auto_closed":True,"reason":"Stop loss / trailing stop","pnl":result}
+            elif s.target_price>0 and price<=s.target_price: result=closed_trades(s);ti={"auto_closed":True,"reason":"Target","pnl":result}
+        if s.position and ti is None:
+            qty=INDICES.get(s.symbol,INDICES["SENSEX"])["lot"]*s.lots;pnl=(price-s.entry_price)*qty if s.position=="LONG" else (s.entry_price-price)*qty;s.unrealized_pnl=round(pnl,2)
+            ti={"position":s.position,"label":s.position_label,"qty":qty,"entry_price":s.entry_price,"sl_price":s.stop_loss,"target_price":s.target_price,"pnl":s.unrealized_pnl}
+        dt=datetime.fromisoformat(c[0]);day_open=float(rows[0][1]);change=price-day_open;pct=change/day_open*100 if day_open else 0
+        result={"status":"success","is_playing":bool(s.is_playing),"current_candle":{"time":int(dt.timestamp())+19800,"open":op,"high":s.current_high,"low":s.current_low,"close":price},"history":history,"trade_info":ti,"realized_pnl":s.realized_pnl,"trade_history":history_of(s),"symbol":s.symbol,"exchange":INDICES[s.symbol]["exchange"],"interval_label":INTERVALS.get(s.interval, "5m"),"change_value":round(change,2),"change_str":f"{'+' if change>=0 else ''}{change:.2f} ({pct:.2f}%)","selected_date":s.selected_date,"synced_time_str":dt.strftime("%d %b %Y  %H:%M:%S IST")}
+        db.session.commit();return jsonify(result)
 
-ADMIN_HTML = """
-<!DOCTYPE html><html><head><title>Admin Panel</title>
-<style>body{background:#131722;color:white;font-family:sans-serif;padding:20px;}h2{color:#2962ff;}table{width:100%;border-collapse:collapse;margin-top:20px;}th,td{padding:10px;border-bottom:1px solid #2a2e39;text-align:left;}th{color:#787b86;}.btn{padding:5px 10px;border-radius:4px;text-decoration:none;font-size:12px;color:white;}.btn-red{background:#ef5350;}.btn-green{background:#089981;}</style></head>
-<body><h2>Admin Panel</h2><a href="/terminal" style="color:#2962ff;">&larr; Terminal</a> | <a href="/logout" style="color:#ef5350;">Logout</a>
-<table><tr><th>ID</th><th>Username</th><th>Status</th><th>Action</th></tr>
-{% for user in users %}<tr><td>{{ user.id }}</td><td>{{ user.username }}</td>
-<td style="color:{% if user.is_active %}#089981{% else %}#ef5350{% endif %};">{% if user.is_active %}Active{% else %}Blocked{% endif %}</td>
-<td>{% if user.is_active %}<a href="/admin/toggle/{{ user.id }}" class="btn btn-red">Block</a>{% else %}<a href="/admin/toggle/{{ user.id }}" class="btn btn-green">Activate</a>{% endif %}</td></tr>{% endfor %}
-</table></body></html>
-"""
 
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <title>Sunny's Terminal</title>
-  <script src="https://unpkg.com/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.js"></script>
-  <style>
-    :root { --bg-main: #ffffff; --bg-panel: #f8f9fd; --bg-hover: #f0f3fa; --bg-active: #e1ecff; --text-main: #131722; --text-muted: #787b86; --border-color: #e0e3eb; --grid-color: #f2f4f9; --overlay-bg: rgba(255, 255, 255, 0.90); --card-shadow: rgba(0, 0, 0, 0.10); }
-    body.dark-mode { --bg-main: #131722; --bg-panel: #1e222d; --bg-hover: #2a2e39; --bg-active: #1e3a8a; --text-main: #d1d4dc; --text-muted: #868993; --border-color: #2a2e39; --grid-color: #1f232e; --overlay-bg: rgba(19, 23, 34, 0.90); --card-shadow: rgba(0, 0, 0, 0.50); }
-    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-font-smoothing: antialiased; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, Ubuntu, sans-serif; background-color: var(--bg-main); color: var(--text-main); height: 100vh; width: 100vw; overflow: hidden; display: flex; flex-direction: column; font-size: 13px; transition: background-color 0.15s, color 0.15s; }
-    .icon-btn { display: inline-flex; align-items: center; justify-content: center; height: 30px; min-width: 30px; padding: 0 5px; border-radius: 4px; color: var(--text-main); cursor: pointer; background: transparent; border: none; font-family: inherit; }
-    .icon-btn:hover { background-color: var(--bg-hover); }
-    .icon-btn.active { background-color: var(--bg-active); color: #2962ff; }
-    .icon-btn svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.5; }
-    .v-divider { width: 1px; height: 22px; background-color: var(--border-color); margin: 0 4px; flex-shrink: 0; }
-    .top-bar { height: 40px; border-bottom: 1px solid var(--border-color); display: flex; align-items: center; justify-content: space-between; padding: 0 0 0 6px; background: var(--bg-main); flex-shrink: 0; z-index: 30; }
-    .top-left, .top-right { display: flex; align-items: center; gap: 2px; }
-    .dhan-logo-wrap { display: flex; align-items: center; gap: 3px; padding: 2px 4px; cursor: pointer; }
-    .dhan-circle { width: 22px; height: 22px; border-radius: 50%; background-color: #00b07c; color: #fff; font-weight: 800; font-size: 12px; display: flex; align-items: center; justify-content: center; letter-spacing: -0.5px; }
-    .chevron-down { width: 12px !important; height: 12px !important; stroke-width: 1.8 !important; }
-    .symbol-search { display: flex; align-items: center; gap: 5px; padding: 4px 8px; font-weight: 700; font-size: 13.5px; cursor: pointer; border-radius: 4px; }
-    .symbol-search:hover { background-color: var(--bg-hover); }
-    .symbol-search select { border: none; background: transparent; font-weight: 700; font-size: 13.5px; outline: none; cursor: pointer; color: var(--text-main); }
-    .symbol-search select option { background: var(--bg-main); color: var(--text-main); }
-    .tf-group { display: flex; align-items: center; gap: 1px; }
-    .tf-item { padding: 5px 7px; border-radius: 4px; font-size: 13px; color: var(--text-main); cursor: pointer; }
-    .tf-item:hover { background-color: var(--bg-hover); }
-    .tf-item.active { background-color: var(--bg-hover); font-weight: 600; color: #2962ff; }
-    .btn-sell { background-color: #ef5350; color: #ffffff; border: none; border-radius: 4px; padding: 4px 11px; font-size: 12.5px; font-weight: 600; cursor: pointer; margin: 0 3px; }
-    .btn-sell:hover { background-color: #d32f2f; }
-    .btn-buy { background-color: #2962ff; color: #ffffff; border: none; border-radius: 4px; padding: 4px 11px; font-size: 12.5px; font-weight: 600; cursor: pointer; margin-right: 3px; }
-    .btn-buy:hover { background-color: #1e4bd8; }
-    .btn-scalper { display: flex; align-items: center; gap: 5px; background-color: var(--bg-hover); color: #2962ff; border: 1px solid #2962ff; border-radius: 4px; padding: 3px 10px; font-size: 12.5px; font-weight: 600; cursor: pointer; margin-left: 3px; }
-    .btn-scalper.active { background-color: #2962ff; color: #ffffff; }
-    .top-input { border: 1px solid var(--border-color); background: var(--bg-panel); color: var(--text-main); border-radius: 4px; padding: 3px 6px; margin-right: 3px; font-family: inherit; font-size: 12px; outline: none; cursor: pointer; }
-    .ctrl-btn { display: inline-flex; align-items: center; justify-content: center; gap: 3px; background: var(--bg-panel); color: var(--text-main); border: 1px solid var(--border-color); border-radius: 4px; padding: 3px 8px; font-size: 12px; font-weight: 600; cursor: pointer; margin-right: 3px; height: 26px; }
-    .ctrl-btn:hover { background: var(--bg-hover); border-color: #2962ff; color: #2962ff; }
-    .ctrl-btn.active { background: #2962ff; color: #ffffff; border-color: #2962ff; }
-    .tc-badge { width: 22px; height: 22px; border-radius: 50%; background: #131722; border: 1px solid var(--border-color); color: #fff; font-size: 9px; font-weight: 800; display: flex; align-items: center; justify-content: center; position: relative; margin: 0 3px; cursor: pointer; }
-    .tc-badge::after { content: ""; width: 5px; height: 5px; background: #ff6d00; border-radius: 50%; position: absolute; right: 2px; bottom: 4px; }
-    .right-collapse-tab { width: 18px; height: 40px; background-color: #878993; color: #ffffff; display: flex; align-items: center; justify-content: center; cursor: pointer; margin-left: 2px; }
-    .workspace { flex: 1; display: flex; overflow: hidden; position: relative; }
-    .left-toolbar { width: 50px; border-right: 1px solid var(--border-color); display: flex; flex-direction: column; align-items: center; padding-top: 6px; background: var(--bg-main); flex-shrink: 0; position: relative; justify-content: space-between; z-index: 10; }
-    .tool-list { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; }
-    .tool-btn { width: 34px; height: 34px; border-radius: 4px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--text-main); }
-    .tool-btn:hover { background-color: var(--bg-hover); }
-    .tool-btn.active { background-color: var(--bg-active); color: #2962ff; }
-    .tool-btn svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.4; }
-    .h-divider { width: 26px; height: 1px; background-color: var(--border-color); margin: 3px 0; }
-    .bottom-star-box { width: 34px; height: 24px; background-color: #363a45; border-top-left-radius: 4px; border-top-right-radius: 4px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
-    .center-column { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-    .chart-and-axes { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-    .chart-row { flex: 1; display: flex; overflow: hidden; position: relative; gap: 0; }
-    .chart-canvas { flex: 1; position: relative; background-color: var(--bg-main); overflow: hidden; height: 100%; }
-    #chart-container { width: 100%; height: 100%; position: absolute; top: 0; left: 0; z-index: 1; }
-    .ohlc-overlay { position: absolute; top: 10px; left: 12px; z-index: 5; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
-    .ohlc-row { display: flex; align-items: center; gap: 8px; font-size: 13px; background: var(--overlay-bg); padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border-color); pointer-events: auto; }
-    .sensex-mini-badge { width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--border-color); display: flex; align-items: center; justify-content: center; font-size: 6px; font-weight: 800; color: #2962ff; background: var(--bg-panel); }
-    .instrument-title { font-weight: 600; font-size: 15px; color: var(--text-main); }
-    .market-status-pill { width: 18px; height: 18px; border-radius: 50%; background: var(--bg-hover); display: flex; align-items: center; justify-content: center; }
-    .market-status-pill span { width: 8px; height: 3px; background: #089981; border-radius: 2px; }
-    .ohlc-values { font-size: 12.5px; color: var(--text-main); display: flex; gap: 6px; font-family: monospace; }
-    .ohlc-values .val { color: #089981; font-weight: 600; }
-    .quick-trade-row { display: flex; align-items: center; gap: 8px; pointer-events: auto; }
-    .qt-box { border-radius: 4px; padding: 4px 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: var(--bg-main); cursor: pointer; line-height: 1.25; box-shadow: 0 2px 5px var(--card-shadow); transition: transform 0.1s; }
-    .qt-box:active { transform: scale(0.96); }
-    .qt-box.sell { border: 1px solid #f23645; color: #f23645; }
-    .qt-box.buy { border: 1px solid #2962ff; color: #2962ff; }
-    .qt-price { font-size: 12.5px; font-weight: 700; }
-    .qt-label { font-size: 10.5px; font-weight: 500; }
-    .qt-spread { font-size: 11px; color: var(--text-muted); background: var(--overlay-bg); padding: 1px 4px; border-radius: 3px; }
-    .scalper-floating { position: absolute; top: 12px; right: 82px; z-index: 20; background: var(--bg-main); border: 1.5px solid #2962ff; border-radius: 6px; padding: 12px; box-shadow: 0 6px 20px var(--card-shadow); display: none; width: 290px; }
-    .scalper-header { display: flex; justify-content: space-between; align-items: center; font-weight: 700; color: #2962ff; margin-bottom: 8px; font-size: 13px; }
-    .scalper-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
-    .scalper-field label { display: block; font-size: 10.5px; color: var(--text-muted); margin-bottom: 3px; font-weight: 600; }
-    .scalper-field input { width: 100%; padding: 5px 6px; border: 1px solid var(--border-color); background: var(--bg-panel); color: var(--text-main); border-radius: 4px; font-size: 12.5px; font-weight: 700; outline: none; }
-    .scalper-field input:focus { border-color: #2962ff; }
-    .bottom-footer { height: 38px; border-top: 1px solid var(--border-color); background: var(--bg-main); display: flex; align-items: center; justify-content: space-between; padding: 0 12px; flex-shrink: 0; z-index: 10; }
-    .range-list { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-main); }
-    .range-list span.range-btn { cursor: pointer; padding: 3px 6px; border-radius: 3px; font-weight: 500; }
-    .range-list span.range-btn:hover { background: var(--bg-hover); color: #2962ff; }
-    .footer-right { display: flex; align-items: center; gap: 12px; font-size: 12.5px; color: var(--text-main); }
-    .dhan-clock-box { font-family: -apple-system, BlinkMacSystemFont, "Trebuchet MS", Roboto, monospace; font-weight: 600; color: var(--text-main); background: var(--bg-panel); padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border-color); }
-    .scale-modes { display: flex; align-items: center; gap: 8px; }
-    .scale-modes span { cursor: pointer; padding: 2px 5px; border-radius: 3px; }
-    .scale-modes span.active { color: #2962ff; font-weight: 700; background: var(--bg-hover); }
-    .trade-drawer { width: 270px; border-left: 1px solid var(--border-color); background: var(--bg-main); display: none; flex-direction: column; z-index: 10; flex-shrink: 0; }
-    .drawer-header { padding: 10px 14px; border-bottom: 1px solid var(--border-color); font-weight: 700; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
-    .drawer-body { padding: 12px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 14px; }
-    .stat-card { background: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; }
-    .stat-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 12.5px; }
-    .stat-row input { width: 90px; padding: 3px 5px; border: 1px solid var(--border-color); background: var(--bg-main); color: var(--text-main); border-radius: 3px; font-size: 12px; }
-    .pnl-banner { font-size: 20px; font-weight: 800; text-align: center; margin: 10px 0; padding: 10px; border-radius: 6px; background: var(--bg-hover); color: var(--text-main); }
-    .history-item { border-bottom: 1px solid var(--border-color); padding: 6px 0; font-size: 11.5px; display: flex; justify-content: space-between; align-items: center; }
-    .right-sidebar { width: 44px; border-left: 1px solid var(--border-color); background: var(--bg-main); display: flex; flex-direction: column; align-items: center; padding-top: 8px; gap: 14px; flex-shrink: 0; z-index: 12; }
-    
-    #trialOverlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.95); z-index: 9999; display: none; justify-content: center; align-items: center; flex-direction: column; color: white; }
-    .trial-box { background: #1e222d; padding: 30px; border-radius: 10px; border: 1px solid #2962ff; text-align: center; max-width: 400px; }
-    .trial-box h2 { color: #2962ff; margin-top: 0; }
-    .trial-box a { color: #089981; text-decoration: none; font-weight: bold; }
-    .trial-timer { font-weight: bold; color: #ef5350; margin-left: 10px; font-size: 14px; }
-  </style>
-</head>
-<body>
-  <header class="top-bar">
-    <div class="top-left">
-      <div class="dhan-logo-wrap">
-        <div class="dhan-circle">dh</div>
-        <svg class="chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M6 9l6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </div>
-      <div class="symbol-search">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"></circle><line x1="20" y1="20" x2="16" y2="16"></line></svg>
-        <select id="symbolSelector" onchange="changeSymbol()">
-          <option value="SENSEX">SENSEX (BSE)</option>
-          <option value="NIFTY">NIFTY 50 (NSE)</option>
-          <option value="BANKNIFTY">BANKNIFTY (NSE)</option>
-          <option value="FINNIFTY">FINNIFTY (NSE)</option>
-          <option value="MIDCPNIFTY">MIDCPNIFTY (NSE)</option>
-          <option value="BANKEX">BANKEX (BSE)</option>
-          <option value="NIFTYIT">NIFTY IT (NSE)</option>
-          <option value="NIFTYAUTO">NIFTY AUTO (NSE)</option>
-          <option value="NIFTYPHARMA">NIFTY PHARMA (NSE)</option>
-        </select>
-      </div>
-      <button class="icon-btn" title="Fit Chart" onclick="chart.timeScale().fitContent()"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg></button>
-      <div class="v-divider"></div>
-      <div class="tf-group">
-        <span class="tf-item" onclick="setTimeframe('ONE_MINUTE', this)">1m</span>
-        <span class="tf-item active" onclick="setTimeframe('FIVE_MINUTE', this)">5m</span>
-        <span class="tf-item" onclick="setTimeframe('FIFTEEN_MINUTE', this)">15m</span>
-        <span class="tf-item" onclick="setTimeframe('ONE_HOUR', this)">1h</span>
-      </div>
-      <div class="v-divider"></div>
-      <button class="icon-btn" id="emaBtn" onclick="toggleEMA()" title="Toggle 20 EMA Indicator" style="font-style:italic; font-family:serif; font-size:17px; font-weight:600;">f<sub style="font-size:11px; font-style:normal;">x</sub></button>
-      <button class="icon-btn" id="splitChartBtn" onclick="toggleSplitScreen()" title="Split-Screen Dual Chart"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="16" rx="1"/><rect x="13" y="4" width="8" height="16" rx="1"/></svg></button>
-      <button class="icon-btn" onclick="toggleOptionChain()" title="Option Chain Simulator"><svg viewBox="0 0 24 24"><rect x="5" y="10" width="3" height="8"/><rect x="10.5" y="6" width="3" height="12"/><rect x="16" y="12" width="3" height="6"/></svg></button>
-      <div class="v-divider"></div>
-      <button class="btn-sell" onclick="takeTrade('SHORT')" title="Shortcut: S">Sell</button>
-      <button class="btn-buy" onclick="takeTrade('LONG')" title="Shortcut: B">Buy</button>
-      <button class="btn-scalper" id="scalperBtn" onclick="toggleScalper()">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
-        <span>Scalper</span>
-      </button>
-    </div>
-    <div class="top-right">
-      <span class="trial-timer" id="trialTimerDisplay"></span>
-      <button class="ctrl-btn" id="barCutterBtn" onclick="toggleBarCutter()" title="Click any candle to replay from there">✂️ <span>Cut</span></button>
-      <!-- DATE PICKER YAHAN HAI -->
-      <input type="date" id="datePicker" class="top-input" value="2026-10-26" title="Select Replay Date" style="width: 130px;">
-      <button class="ctrl-btn" id="playPauseBtn" onclick="togglePlay()" title="Play/Pause (Space)">⏸ Pause</button>
-      <button class="ctrl-btn" onclick="stepForward()" title="Next Candle (&gt;|)">&gt;|</button>
-      <button class="ctrl-btn" onclick="resetSimulation()" title="Reset (R)">🔄 Reset</button>
-      <select id="speedControl" class="top-input" onchange="changeSpeed()">
-        <option value="1">1x Speed</option>
-        <option value="2">2x Speed</option>
-        <option value="5">5x Speed</option>
-        <option value="10">10x Speed</option>
-        <option value="25">25x Speed</option>
-        <option value="50">50x Speed</option>
-      </select>
-      <button class="icon-btn" id="themeToggleBtn" onclick="toggleTheme()" title="Day/Night Mode" style="font-size:15px;">🌙</button>
-      <button class="icon-btn" onclick="toggleDrawer()" title="Trading Panel"><svg viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="12" rx="2"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/></svg></button>
-      <div class="tc-badge" title="Connected">TC</div>
-      <div class="right-collapse-tab" onclick="toggleDrawer()"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg></div>
-      <a href="/logout" style="color:#2962ff; text-decoration:none; font-weight:bold; margin-left:10px;">Logout ({{ username }})</a>
-    </div>
-  </header>
+@app.errorhandler(404)
+def not_found(_):
+    return (jsonify(status="error",message="Endpoint or data not found."),404) if request.path.startswith("/api/") else ("Page not found.",404)
 
-  <div class="workspace">
-    <aside class="left-toolbar">
-      <div class="tool-list">
-        <div class="tool-btn active" id="cursorTool" onclick="setDrawingMode(false)" title="Crosshair"><svg viewBox="0 0 24 24"><line x1="12" y1="3" x2="12" y2="21"/><line x1="3" y1="12" x2="21" y2="12"/></svg></div>
-        <div class="tool-btn" id="hlineTool" onclick="setDrawingMode(true)" title="Draw Support/Resistance"><svg viewBox="0 0 24 24"><line x1="3" y1="12" x2="21" y2="12"/><circle cx="12" cy="12" r="2.2" fill="currentColor"/></svg></div>
-        <div class="tool-btn" id="leftCutTool" onclick="toggleBarCutter()" title="Bar Cutter"><svg viewBox="0 0 24 24"><polygon points="11 17 6 12 11 7 11 17"/><polygon points="18 17 13 12 18 7 18 17"/></svg></div>
-        <div class="tool-btn" onclick="toggleOptionChain()" title="Option Chain"><svg viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="11" x2="20" y2="11"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="7" cy="6" r="1.5"/><circle cx="16" cy="16" r="1.5"/></svg></div>
-        <div class="tool-btn" onclick="toggleScalper()" title="Scalper"><svg viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1"/><line x1="4" y1="12" x2="20" y2="12"/><path d="M8 9l3 3 5-5"/></svg></div>
-        <div class="h-divider"></div>
-        <div class="tool-btn" onclick="chart.timeScale().fitContent()" title="Zoom Reset"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><line x1="20" y1="20" x2="15.5" y2="15.5"/><path d="M11 8v6M8 11h6"/></svg></div>
-        <div class="h-divider"></div>
-        <div class="tool-btn" onclick="clearDrawings()" title="Clear Lines"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg></div>
-      </div>
-      <div class="bottom-star-box"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.8"><polygon points="12 2 15 9 22 9 16.5 14 18.5 21 12 17 5.5 21 7.5 14 2 9 9 9"/></svg></div>
-    </aside>
 
-    <div class="center-column">
-      <div class="chart-and-axes">
-        <div class="chart-row">
-          <div class="chart-canvas" id="primaryCanvas">
-            <div id="chart-container"></div>
-            <div class="ohlc-overlay">
-              <div class="ohlc-row">
-                <div class="sensex-mini-badge" id="miniBadge">IDX</div>
-                <span class="instrument-title" id="chSymbol">SENSEX · 5 · BSE</span>
-                <div class="market-status-pill"><span id="statusDot"></span></div>
-                <div class="ohlc-values" id="chOhlc">
-                  <span>O<span class="val" id="chO">0.00</span></span>
-                  <span>H<span class="val" id="chH">0.00</span></span>
-                  <span>L<span class="val" id="chL">0.00</span></span>
-                  <span>C<span class="val" id="chC">0.00</span></span>
-                  <span class="val" id="chChange">0.00 (0.00%)</span>
-                </div>
-              </div>
-              <div class="quick-trade-row">
-                <div class="qt-box sell" onclick="takeTrade('SHORT')"><span class="qt-price" id="floatSellPrice">0.00</span><span class="qt-label">SELL</span></div>
-                <span class="qt-spread">0.00</span>
-                <div class="qt-box buy" onclick="takeTrade('LONG')"><span class="qt-price" id="floatBuyPrice">0.00</span><span class="qt-label">BUY</span></div>
-              </div>
-            </div>
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback();log.exception("Unhandled server error",exc_info=error)
+    return (jsonify(status="error",message="Unexpected server error; check server log."),500) if request.path.startswith("/api/") else ("Unexpected server error; check server log.",500)
 
-            <div class="scalper-floating" id="scalperPanel">
-              <div class="scalper-header">
-                <span>⚡ Scalper Order</span>
-                <span style="cursor:pointer; color:var(--text-muted);" onclick="toggleScalper()">✕</span>
-              </div>
-              <div class="scalper-grid">
-                <div class="scalper-field"><label>Lots</label><input type="number" id="inpLots" value="1" min="1" max="500"></div>
-                <div class="scalper-field"><label>SL Pts</label><input type="number" id="inpSlPts" value="20" min="0"></div>
-                <div class="scalper-field"><label>Target Pts</label><input type="number" id="inpTpPts" value="40" min="0"></div>
-                <div class="scalper-field"><label>TSL Pts</label><input type="number" id="inpTslPts" value="0" min="0"></div>
-              </div>
-              <div style="display:flex; gap:6px;">
-                <button class="btn-sell" style="flex:1; margin:0; padding:7px;" onclick="takeTrade('SHORT')">SELL</button>
-                <button class="btn-buy" style="flex:1; margin:0; padding:7px;" onclick="takeTrade('LONG')">BUY</button>
-              </div>
-            </div>
 
-            <div class="toast-msg" id="toastMsg"></div>
-          </div>
-        </div>
-      </div>
+if __name__ == "__main__":
+    print("Paper Trading Replay Terminal: http://127.0.0.1:5000")
+    print("Default admin login: admin / admin123")
+    app.run(host=os.environ.get("HOST","127.0.0.1"),port=int(os.environ.get("PORT","5000")),debug=False,use_reloader=False,threaded=True)
 
-      <footer class="bottom-footer">
-        <div class="range-list">
-          <span style="font-weight:600; color:var(--text-muted);">Realized PnL: <strong id="footerRealizedPnl" style="color:var(--text-main);">₹ 0.00</strong></span>
-        </div>
-        <div class="footer-right">
-          <span id="syncedDhanClock" class="dhan-clock-box">26 Oct 2026  09:15:00 UTC+5:30</span>
-          <div class="v-divider"></div>
-          <div class="scale-modes"><span>%</span><span>log</span><span class="active">auto</span></div>
-        </div>
-      </footer>
-    </div>
-
-    <aside class="trade-drawer" id="tradePanel">
-      <div class="drawer-header"><span>Paper Trading</span><span style="cursor:pointer; color:var(--text-muted);" onclick="toggleDrawer()">✕</span></div>
-      <div class="drawer-body">
-        <div id="noPosition" class="stat-card" style="text-align:center; color:var(--text-muted);">No open positions.<br>Click <b>Buy</b> or <b>Sell</b>.</div>
-        <div id="openPosition" class="stat-card" style="display:none;">
-          <div class="stat-row"><span>Instrument:</span> <strong id="posSymbol">-</strong></div>
-          <div class="stat-row"><span>Type:</span> <strong id="posType">-</strong></div>
-          <div class="stat-row"><span>Quantity:</span> <strong id="posQty">-</strong></div>
-          <div class="stat-row"><span>Entry:</span> <strong id="posEntry">-</strong></div>
-          <div class="stat-row"><span>SL Price:</span> <strong id="posSl" style="color:#f23645;">-</strong></div>
-          <div class="stat-row"><span>Target Price:</span> <strong id="posTp" style="color:#089981;">-</strong></div>
-          <div class="stat-row"><span>LTP:</span> <strong id="posLtp">-</strong></div>
-          <div id="pnlDisplay" class="pnl-banner">₹ 0.00</div>
-          <button onclick="closeTrade()" style="width:100%; padding:10px; background:#f59e0b; color:white; border:none; border-radius:4px; font-weight:700; cursor:pointer;">SQUARE OFF</button>
-        </div>
-        <div>
-          <div style="font-weight:700; margin-bottom:8px; font-size:12px; color:var(--text-muted); text-transform:uppercase;">Closed Trades</div>
-          <div id="historyList" style="display:flex; flex-direction:column; gap:4px;"><div style="color:var(--text-muted); font-size:12px;">No closed trades.</div></div>
-        </div>
-      </div>
-    </aside>
-
-    <aside class="right-sidebar">
-      <button class="icon-btn active" onclick="toggleDrawer()" title="Positions"><svg viewBox="0 0 24 24"><path d="M6 4h12v16l-6-4-6 4V4z"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="9" y1="11" x2="15" y2="11"/></svg></button>
-      <button class="icon-btn" onclick="toggleScalper()" title="Scalper"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 9h4M10 7v4M8 14h8M8 17h6"/></svg></button>
-    </aside>
-  </div>
-
-  <div id="trialOverlay">
-    <div class="trial-box">
-        <h2>⏳ Trial Expired</h2>
-        <p>Aapka 2 minute ka free trial khatam ho gaya hai.</p>
-        <p>Full access ke liye contact karein:</p>
-        <hr style="border-color:#2a2e39; margin:20px 0;">
-        <h3 style="color:#089981; margin:0;">Sunny Dev Anand</h3>
-        <p>Software Engineer</p>
-        <p>📧 <a href="mailto:itsmywayokok@gmail.com">itsmywayokok@gmail.com</a></p>
-        <p>📱 <a href="https://wa.me/917667765215">+91 7667765215 (WhatsApp)</a></p>
-    </div>
-  </div>
-
-  <script>
-    let trialSeconds = {{ trial }};
-    function updateTrialTimer() {
-        if (trialSeconds <= 0) { document.getElementById('trialOverlay').style.display = 'flex'; return; }
-        let m = Math.floor(trialSeconds / 60), s = trialSeconds % 60;
-        document.getElementById('trialTimerDisplay').innerText = `⏳ ${m}:${s < 10 ? '0' : ''}${s}`;
-        trialSeconds--;
-    }
-    if (trialSeconds <= 0) document.getElementById('trialOverlay').style.display = 'flex';
-    else { updateTrialTimer(); setInterval(updateTrialTimer, 1000); }
-
-    let isDarkMode = false;
-    const chartContainer = document.getElementById('chart-container');
-    const chart = LightweightCharts.createChart(chartContainer, {
-      width: chartContainer.clientWidth, height: chartContainer.clientHeight,
-      layout: { background: { color: '#ffffff' }, textColor: '#131722', fontSize: 11.5 },
-      grid: { vertLines: { color: '#f2f4f9', style: 0 }, horzLines: { color: '#f2f4f9', style: 0 } },
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#e0e3eb', rightOffset: 8, barSpacing: 8 },
-      rightPriceScale: { borderColor: '#e0e3eb', autoScale: true, scaleMargins: { top: 0.12, bottom: 0.12 } },
-      crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
-    });
-
-    const candleSeries = chart.addCandlestickSeries({ upColor: '#089981', downColor: '#f23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#f23645' });
-
-    let allCandles = [];
-    let entryLine = null, slLine = null, tpLine = null, userLines = [];
-    let drawingHLineMode = false, lastCrosshairPrice = null;
-    let currentUnderlyingPrice = 0;
-
-    function toggleTheme() {
-      isDarkMode = !isDarkMode;
-      document.body.classList.toggle('dark-mode', isDarkMode);
-      document.getElementById('themeToggleBtn').innerText = isDarkMode ? '☀️' : '🌙';
-      chart.applyOptions({
-        layout: { background: { color: isDarkMode ? '#131722' : '#ffffff' }, textColor: isDarkMode ? '#d1d4dc' : '#131722' },
-        grid: { vertLines: { color: isDarkMode ? '#1f232e' : '#f2f4f9' }, horzLines: { color: isDarkMode ? '#1f232e' : '#f2f4f9' } },
-        timeScale: { borderColor: isDarkMode ? '#2a2e39' : '#e0e3eb' },
-        rightPriceScale: { borderColor: isDarkMode ? '#2a2e39' : '#e0e3eb' }
-      });
-    }
-
-    chart.subscribeCrosshairMove(param => {
-      if (param.point) lastCrosshairPrice = candleSeries.coordinateToPrice(param.point.y);
-    });
-
-    chart.subscribeClick(async (param) => {
-      if (drawingHLineMode && lastCrosshairPrice !== null) {
-        const line = candleSeries.createPriceLine({ price: lastCrosshairPrice, color: '#2962ff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'S/R' });
-        userLines.push(line);
-        setDrawingMode(false);
-      }
-    });
-
-    function setDrawingMode(active) {
-      drawingHLineMode = active;
-      document.getElementById('hlineTool').classList.toggle('active', active);
-      document.getElementById('cursorTool').classList.toggle('active', !active);
-    }
-
-    function clearDrawings() {
-      userLines.forEach(l => candleSeries.removePriceLine(l));
-      userLines = [];
-    }
-
-    function removePositionLines() {
-      if (entryLine) { candleSeries.removePriceLine(entryLine); entryLine = null; }
-      if (slLine) { candleSeries.removePriceLine(slLine); slLine = null; }
-      if (tpLine) { candleSeries.removePriceLine(tpLine); tpLine = null; }
-    }
-
-    function drawPositionLines(ti) {
-      removePositionLines();
-      if (!ti || !ti.position) return;
-      entryLine = candleSeries.createPriceLine({ price: ti.entry_price, color: '#2962ff', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Solid, axisLabelVisible: true, title: `ENTRY` });
-      if (ti.sl_price > 0) slLine = candleSeries.createPriceLine({ price: ti.sl_price, color: '#f23645', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'SL' });
-      if (ti.target_price > 0) tpLine = candleSeries.createPriceLine({ price: ti.target_price, color: '#089981', lineWidth: 2, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'TARGET' });
-    }
-
-    function showToast(msg) {
-      const el = document.getElementById('toastMsg');
-      el.innerText = msg; el.style.display = 'block';
-      setTimeout(() => { el.style.display = 'none'; }, 3000);
-    }
-
-    function toggleScalper() {
-      const panel = document.getElementById('scalperPanel');
-      panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
-      document.getElementById('scalperBtn').classList.toggle('active', panel.style.display === 'block');
-    }
-
-    function toggleDrawer() {
-      const drawer = document.getElementById('tradePanel');
-      drawer.style.display = drawer.style.display === 'flex' ? 'none' : 'flex';
-      setTimeout(() => { chart.applyOptions({ width: chartContainer.clientWidth, height: chartContainer.clientHeight }); }, 50);
-    }
-
-    async function changeSymbol() {
-      allCandles = []; candleSeries.setData([]); removePositionLines();
-      await fetch('/api/change_symbol/' + document.getElementById('symbolSelector').value);
-    }
-
-    async function setTimeframe(interval, btn) {
-      document.querySelectorAll('.tf-item').forEach(el => el.classList.remove('active'));
-      btn.classList.add('active');
-      allCandles = []; candleSeries.setData([]); removePositionLines();
-      await fetch('/api/set_interval/' + interval);
-    }
-
-    async function changeSpeed() {
-      await fetch('/api/set_speed/' + document.getElementById('speedControl').value);
-    }
-
-    // 🔥 DATE PICKER CHANGE EVENT 🔥
-    document.getElementById('datePicker').addEventListener('change', async () => {
-      let selectedDate = document.getElementById('datePicker').value;
-      if(!selectedDate) return;
-      
-      allCandles = []; 
-      candleSeries.setData([]); 
-      removePositionLines();
-      document.getElementById('tradePanel').style.display = 'none';
-      document.getElementById('chSymbol').innerText = "Loading data...";
-      document.getElementById('playPauseBtn').innerText = '⏸ Pause';
-      
-      // Backend ko date bhejo (Yeh is_playing = True karega)
-      await fetch('/api/set_date?date=' + selectedDate);
-      
-      // UI update karo
-      document.getElementById('syncedDhanClock').innerText = `${selectedDate} 09:15:00 UTC+5:30`;
-      showToast(`Data loading for ${selectedDate}...`);
-      
-      // 1.5 sec baad verify karein
-      setTimeout(async () => {
-        try {
-            const res = await fetch('/api/get_tick');
-            const data = await res.json();
-            if (data.status === 'success' && data.current_candle) {
-                showToast(`✅ Loaded: ${selectedDate}`);
-            } else {
-                showToast(`❌ No data for ${selectedDate} (Weekend/Holiday?)`);
-            }
-        } catch(e) {}
-      }, 1500);
-    });
-
-    async function togglePlay() {
-      const res = await fetch('/api/toggle_play', { method: 'POST' });
-      const data = await res.json();
-      document.getElementById('playPauseBtn').innerText = data.is_playing ? '⏸ Pause' : '▶ Play';
-    }
-
-    async function stepForward() { await fetch('/api/step_candle', { method: 'POST' }); }
-
-    async function resetSimulation() {
-      allCandles = []; candleSeries.setData([]); removePositionLines();
-      document.getElementById('tradePanel').style.display = 'none';
-      await fetch('/api/reset_sim', { method: 'POST' });
-      document.getElementById('playPauseBtn').innerText = '⏸ Pause';
-      chart.timeScale().fitContent();
-    }
-
-    async function takeTrade(type) {
-      const lots = parseInt(document.getElementById('inpLots').value) || 1;
-      const slPoints = parseFloat(document.getElementById('inpSlPts').value) || 20;
-      const targetPoints = parseFloat(document.getElementById('inpTpPts').value) || 40;
-      const tslPoints = parseFloat(document.getElementById('inpTslPts').value) || 0;
-
-      const res = await fetch('/api/trade', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: type, lots: lots, sl_points: slPoints, target_points: targetPoints, tsl_points: tslPoints })
-      });
-      const data = await res.json();
-      if (data.status === 'success') {
-        const ti = data.trade_info;
-        document.getElementById('tradePanel').style.display = 'flex';
-        document.getElementById('noPosition').style.display = 'none';
-        document.getElementById('openPosition').style.display = 'block';
-        document.getElementById('posSymbol').innerText = ti.label;
-        document.getElementById('posType').innerText = ti.position;
-        document.getElementById('posQty').innerText = ti.qty;
-        document.getElementById('posEntry').innerText = ti.entry_price.toFixed(2);
-        document.getElementById('posSl').innerText = ti.sl_price.toFixed(2);
-        document.getElementById('posTp').innerText = ti.target_price.toFixed(2);
-        drawPositionLines(ti);
-      } else { alert(data.message); }
-    }
-
-    async function closeTrade() {
-      const res = await fetch('/api/close_trade', { method: 'POST' });
-      const data = await res.json();
-      if (data.status === 'success') {
-        removePositionLines();
-        alert(`Trade Closed! Final PnL: ₹ ${data.final_pnl.toFixed(2)}`);
-        document.getElementById('tradePanel').style.display = 'none';
-      }
-    }
-
-    function renderTradeHistory(list) {
-      const container = document.getElementById('historyList');
-      if (!list || list.length === 0) { container.innerHTML = '<div style="color:var(--text-muted); font-size:12px;">No closed trades.</div>'; return; }
-      container.innerHTML = list.slice(0, 8).map(item => {
-        const color = item.pnl >= 0 ? '#089981' : '#f23645';
-        return `<div class="history-item"><div><strong>${item.symbol}</strong> <span style="color:${item.type === 'LONG' ? '#2962ff' : '#f23645'}">${item.type}</span> (${item.reason})<br><span style="color:var(--text-muted);">${item.entry} → ${item.exit}</span></div><div style="font-weight:700; color:${color};">${item.pnl >= 0 ? '+' : ''}₹${item.pnl.toFixed(2)}</div></div>`;
-      }).join('');
-    }
-
-    let isFetchingTick = false;
-    async function fetchLiveData() {
-      if (isFetchingTick) return;
-      isFetchingTick = true;
-      try {
-        const response = await fetch('/api/get_tick');
-        const result = await response.json();
-        if (result.status === 'success') {
-          if (result.synced_time_str) document.getElementById('syncedDhanClock').innerText = result.synced_time_str;
-          
-          if (result.history && result.history.length > 0) {
-            allCandles = result.history;
-            candleSeries.setData(allCandles);
-          }
-          
-          if (result.current_candle) {
-            const c = result.current_candle;
-            currentUnderlyingPrice = c.close;
-            candleSeries.update(c);
-            if (allCandles.length > 0 && allCandles[allCandles.length - 1].time === c.time) {
-              allCandles[allCandles.length - 1] = c;
-            } else { allCandles.push(c); }
-
-            document.getElementById('chO').innerText = c.open.toFixed(2);
-            document.getElementById('chH').innerText = c.high.toFixed(2);
-            document.getElementById('chL').innerText = c.low.toFixed(2);
-            document.getElementById('chC').innerText = c.close.toFixed(2);
-            document.getElementById('floatSellPrice').innerText = c.close.toFixed(2);
-            document.getElementById('floatBuyPrice').innerText = c.close.toFixed(2);
-            document.getElementById('chChange').innerText = result.change_str;
-            document.getElementById('chSymbol').innerText = `${result.symbol} · ${result.interval_name} · ${result.exchange}`;
-            document.getElementById('miniBadge').innerText = result.symbol.substring(0, 6);
-          }
-          
-          const rPnl = result.realized_pnl || 0;
-          document.getElementById('footerRealizedPnl').innerText = `${rPnl >= 0 ? '+' : ''}₹ ${rPnl.toFixed(2)}`;
-          renderTradeHistory(result.trade_history);
-
-          if (result.trade_info && result.trade_info.auto_closed) {
-            removePositionLines();
-            document.getElementById('tradePanel').style.display = 'none';
-            alert(`Trade Auto Closed! Hit ${result.trade_info.reason}. Final PnL: ₹ ${result.trade_info.pnl.toFixed(2)}`);
-          } else if (result.trade_info && result.trade_info.position) {
-            const pnl = result.trade_info.pnl;
-            const pnlEl = document.getElementById('pnlDisplay');
-            document.getElementById('posLtp').innerText = result.current_candle.close.toFixed(2);
-            document.getElementById('posSl').innerText = result.trade_info.sl_price.toFixed(2);
-            pnlEl.innerText = (pnl >= 0) ? `+₹ ${pnl.toFixed(2)}` : `-₹ ${Math.abs(pnl).toFixed(2)}`;
-            pnlEl.style.color = (pnl >= 0) ? '#089981' : '#f23645';
-          }
-        }
-      } catch (error) { console.error(error); } finally { isFetchingTick = false; }
-    }
-
-    window.addEventListener('resize', () => { chart.applyOptions({ width: chartContainer.clientWidth, height: chartContainer.clientHeight }); });
-    setInterval(fetchLiveData, 50);
-  </script>
-</body>
-</html>
-"""
-
-if __name__ == '__main__':
-    print("\n" + "="*50)
-    print("🚀 SUNNY'S TERMINAL STARTING...")
-    print("="*50)
-    print("👇 Click the links below (Ctrl + Click):")
-    print("🔗 MAIN PAGE:     http://127.0.0.1:5000/")
-    print("🔗 LOGIN PAGE:    http://127.0.0.1:5000/login")
-    print("🔗 ADMIN PANEL:   http://127.0.0.1:5000/admin")
-    print("="*50)
-    print("🔑 Admin Credentials: admin / admin123")
-    print("="*50 + "\n")
-    app.run(port=5000, debug=True, use_reloader=False)
