@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.request
 from collections import defaultdict, deque
-from datetime import date, datetime, time as clock_time
+from datetime import date, datetime, time as clock_time, timedelta
 from functools import wraps
 from zoneinfo import ZoneInfo
 
@@ -134,6 +134,23 @@ class RuntimeSetting(db.Model):
     value = db.Column(db.String(255), nullable=False)
 
 
+class LiveCandle(db.Model):
+    """Per-user candles captured from the live feed, available later in replay."""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
+    underlying = db.Column(db.String(20), nullable=False)
+    instrument_symbol = db.Column(db.String(80), nullable=False)
+    exchange = db.Column(db.String(8), nullable=False)
+    token = db.Column(db.String(32), nullable=False)
+    interval = db.Column(db.String(20), nullable=False)
+    trade_date = db.Column(db.String(10), nullable=False, index=True)
+    candle_time = db.Column(db.Integer, nullable=False)
+    open = db.Column(db.Float, nullable=False)
+    high = db.Column(db.Float, nullable=False)
+    low = db.Column(db.Float, nullable=False)
+    close = db.Column(db.Float, nullable=False)
+
+
 with app.app_context():
     db.create_all()
     # Lightweight additive migration for existing final_app.db deployments.
@@ -239,21 +256,31 @@ def ensure_smart_login():
         log.info("SmartAPI login successful")
 
 
-def fetch_candles(symbol, interval, selected_date):
+def fetch_candles(symbol, interval, selected_date, lookback_days=1):
     instrument = INDICES[symbol]
-    return fetch_instrument_candles(instrument["exchange"], instrument["token"], interval, selected_date)
+    return fetch_instrument_candles(instrument["exchange"], instrument["token"], interval, selected_date, lookback_days)
 
 
-def fetch_instrument_candles(exchange, token, interval, selected_date):
-    key = (exchange, str(token), interval, selected_date)
+def max_history_days(interval):
+    return {"ONE_MINUTE": 30, "FIVE_MINUTE": 100, "FIFTEEN_MINUTE": 200}.get(interval, 30)
+
+
+def fetch_instrument_candles(exchange, token, interval, selected_date, lookback_days=1):
+    try:
+        lookback_days = max(1, min(int(lookback_days), max_history_days(interval)))
+    except (TypeError, ValueError):
+        lookback_days = 1
+    key = (exchange, str(token), interval, selected_date, lookback_days)
     with cache_lock:
         if key in history_cache:
             return history_cache[key]
     day = date.fromisoformat(selected_date)
     now = datetime.now(IST)
-    start = datetime.combine(day, clock_time(9, 15), tzinfo=IST)
+    start_day = day - timedelta(days=lookback_days - 1)
+    start = datetime.combine(start_day, clock_time(9, 15), tzinfo=IST)
     close = datetime.combine(day, clock_time(15, 30), tzinfo=IST)
-    if day == now.date() and now < start:
+    day_start = datetime.combine(day, clock_time(9, 15), tzinfo=IST)
+    if lookback_days == 1 and day == now.date() and now < day_start:
         raise ValueError("Market opens at 09:15 IST. Select a past trading date or try after market open.")
     end = min(now, close) if day == now.date() else close
     params = {"exchange": exchange, "symboltoken": str(token),
@@ -334,7 +361,7 @@ def make_live_candle(user_id, exchange, token, interval, price, seed=None):
     period = {"ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900}.get(interval, 60)
     now_epoch = int(time.time())
     bucket = now_epoch - (now_epoch % period)
-    key = (user_id, exchange, str(token), interval)
+    key = (user_id, exchange, str(token), interval, datetime.now(IST).date().isoformat())
     with live_candle_lock:
         current = live_candle_state.get(key)
         if current is None or current["time"] != bucket:
@@ -354,6 +381,48 @@ def make_live_candle(user_id, exchange, token, interval, price, seed=None):
             current["low"] = min(float(current["low"]), price)
             current["close"] = price
         return dict(current)
+
+
+def save_live_candle(user_id, underlying, instrument_symbol, exchange, token, interval, trade_date, candle):
+    """Upsert the current live candle so ending live mode does not lose it."""
+    with live_candle_lock:
+        query = db.select(LiveCandle).filter_by(
+            user_id=user_id, exchange=exchange, token=str(token), interval=interval,
+            trade_date=trade_date, candle_time=int(candle["time"])
+        )
+        saved = db.session.execute(query).scalar_one_or_none()
+        if saved is None:
+            saved = LiveCandle(user_id=user_id, underlying=underlying,
+                               instrument_symbol=instrument_symbol, exchange=exchange,
+                               token=str(token), interval=interval, trade_date=trade_date,
+                               candle_time=int(candle["time"]), open=candle["open"],
+                               high=candle["high"], low=candle["low"], close=candle["close"])
+            db.session.add(saved)
+        else:
+            saved.open = candle["open"]
+            saved.high = candle["high"]
+            saved.low = candle["low"]
+            saved.close = candle["close"]
+
+
+def merge_recorded_live_candles(rows, user_id, underlying, exchange, token, interval, trade_date):
+    """Overlay locally captured live OHLC on broker history for replay."""
+    recorded = db.session.scalars(db.select(LiveCandle).filter_by(
+        user_id=user_id, underlying=underlying, exchange=exchange, token=str(token),
+        interval=interval, trade_date=trade_date
+    ).order_by(LiveCandle.candle_time)).all()
+    if not recorded:
+        return rows
+    by_time = {}
+    for row in rows:
+        try:
+            by_time[chart_candle(row)["time"]] = row
+        except (TypeError, ValueError, IndexError):
+            continue
+    for item in recorded:
+        stamp = datetime.fromtimestamp(item.candle_time, IST).isoformat()
+        by_time[item.candle_time] = [stamp, item.open, item.high, item.low, item.close, 0.0]
+    return [by_time[stamp] for stamp in sorted(by_time)]
 
 
 def get_option_master():
@@ -430,7 +499,7 @@ def chart_candle(row):
     return {"time": int(dt.timestamp()), "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4])}
 
 
-def secondary_chart_tick(state, primary_row, progress, client_bootstrap=False):
+def secondary_chart_tick(state, primary_row, progress, client_bootstrap=False, lookback_days=1):
     if not state.secondary_token or not state.secondary_symbol:
         return None
     try:
@@ -439,11 +508,24 @@ def secondary_chart_tick(state, primary_row, progress, client_bootstrap=False):
         except (TypeError, json.JSONDecodeError):
             rows = []
         if not rows:
-            rows = fetch_instrument_candles(state.secondary_exchange, state.secondary_token, state.interval, state.selected_date)
-            if not rows:
-                return {"symbol": state.secondary_symbol, "error": "No historical candles for this option contract/date."}
+            try:
+                rows = fetch_instrument_candles(state.secondary_exchange, state.secondary_token, state.interval,
+                                                state.selected_date, lookback_days)
+            except Exception:
+                rows = []
+        merged_rows = merge_recorded_live_candles(
+            rows, state.user_id, state.symbol, state.secondary_exchange,
+            state.secondary_token, state.interval, state.selected_date
+        )
+        if merged_rows != rows:
+            rows = merged_rows
             state.secondary_data_json = json.dumps(rows, separators=(",", ":"))
             state.secondary_needs_history_reload = True
+        elif not state.secondary_data_json or state.secondary_data_json == "[]":
+            state.secondary_data_json = json.dumps(rows, separators=(",", ":"))
+            state.secondary_needs_history_reload = True
+        if not rows:
+            return {"symbol": state.secondary_symbol, "error": "No historical or recorded live candles for this option contract/date."}
         market_time = datetime.fromisoformat(primary_row[0])
         index = -1
         for position, row in enumerate(rows):
@@ -631,7 +713,7 @@ HTML_PAGE = r"""
 <script>
 (function(){
 document.body.classList.remove('light');
-const csrf=document.querySelector('meta[name="csrf-token"]').content,E=id=>document.getElementById(id);let chart,series,chart2,series2,bars=[],bars2=[],busy=false,trial={{ trial }},fullAccess={{ 'true' if full_access else 'false' }},secondaryEnabled={{ 'true' if has_secondary else 'false' }},splitMode={{ 'true' if has_secondary else 'false' }},draw=false,lines=[],syncingRange=false,bootstrapPending=true,secondaryRangeSynced=false,liveMode=false,liveBootstrapPending=false;
+const csrf=document.querySelector('meta[name="csrf-token"]').content,E=id=>document.getElementById(id);let chart,series,chart2,series2,bars=[],bars2=[],busy=false,trial={{ trial }},fullAccess={{ 'true' if full_access else 'false' }},secondaryEnabled={{ 'true' if has_secondary else 'false' }},splitMode={{ 'true' if has_secondary else 'false' }},draw=false,lines=[],syncingRange=false,bootstrapPending=true,secondaryRangeSynced=false,liveMode=false,liveBootstrapPending=false,replayLookbackOverride={{ 'null' if selected_date == max_date else '1' }};
 async function api(url,opts){opts=opts||{};opts.headers=Object.assign({},opts.headers||{}, {'X-CSRFToken':csrf});if(opts.body&&typeof opts.body==='object'){opts.headers['Content-Type']='application/json';opts.body=JSON.stringify(opts.body)}const r=await fetch(url,opts);let d={};try{d=await r.json()}catch(_){}if(!r.ok||d.status==='error')throw Error(d.message||('Request failed ('+r.status+')'));return d}
 function toast(s){const t=E('toast');t.textContent=s;t.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.style.display='none',3500)}function f(n){return Number(n||0).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}function updateSeries(seriesRef,barList,candle){seriesRef.update(candle);const i=barList.findIndex(x=>x.time===candle.time);if(i>=0)barList[i]=candle;else barList.push(candle)}function applyFinalized(seriesRef,barList,candles){for(const candle of candles||[])updateSeries(seriesRef,barList,candle)}function safe(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function chartOptions(box){return {width:Math.max(200,box.clientWidth),height:Math.max(120,box.clientHeight),layout:{background:{color:'#131722'},textColor:'#d1d4dc',fontSize:12},grid:{vertLines:{color:'#252a36'},horzLines:{color:'#252a36'}},timeScale:{timeVisible:true,secondsVisible:false,borderColor:'#2a2e39',rightOffset:6},rightPriceScale:{borderColor:'#2a2e39'},crosshair:{mode:LightweightCharts.CrosshairMode.Normal}}}
@@ -640,12 +722,12 @@ function resizeCharts(){[[chart,E('chart')],[chart2,E('chartSecondary')]].forEac
 function initChart(){const box=E('chart'),box2=E('chartSecondary');chart=LightweightCharts.createChart(box,chartOptions(box));chart2=LightweightCharts.createChart(box2,chartOptions(box2));const opts={upColor:'#089981',downColor:'#f23645',borderVisible:false,wickUpColor:'#089981',wickDownColor:'#f23645'};series=chart.addCandlestickSeries(opts);series2=chart2.addCandlestickSeries(opts);window.addEventListener('resize',resizeCharts);if(window.ResizeObserver){const ro=new ResizeObserver(resizeCharts);ro.observe(E('charts'));ro.observe(E('chart'));ro.observe(E('chartSecondary'))}setupDivider();chart.subscribeClick(p=>{if(draw&&p.point){let price=series.coordinateToPrice(p.point.y);if(price)series.createPriceLine({price,color:'#2962ff',lineStyle:LightweightCharts.LineStyle.Dashed,title:'S/R',axisLabelVisible:true});draw=false;E('line').classList.remove('active')}});requestAnimationFrame(resizeCharts)}
 function drawPosition(t){lines.forEach(x=>series.removePriceLine(x));lines=[];if(!t||!t.position)return;lines.push(series.createPriceLine({price:t.entry_price,color:'#2962ff',lineWidth:2,title:'ENTRY'}));if(t.sl_price>0)lines.push(series.createPriceLine({price:t.sl_price,color:'#f23645',lineStyle:2,title:'SL'}));if(t.target_price>0)lines.push(series.createPriceLine({price:t.target_price,color:'#089981',lineStyle:2,title:'TARGET'}))}
 function renderSecondary(sc){if(!sc){E('secondaryTitle').textContent='Choose a CE/PE contract from Option Chain';E('secondaryPlaceholder').textContent='Select a CE/PE contract in Option Chain to add its synchronized replay chart.';E('secondaryPlaceholder').style.display=splitMode?'flex':'none';return}E('secondaryTitle').textContent=sc.symbol+(sc.interval_label?' · '+sc.interval_label:'');if(sc.error){E('secondaryPlaceholder').textContent=sc.error;E('secondaryPlaceholder').style.display='flex';return}if(sc.waiting||!sc.current_candle){E('secondaryPlaceholder').textContent='Waiting for this option’s first candle at the replay time…';E('secondaryPlaceholder').style.display='flex';return}E('secondaryPlaceholder').style.display='none';if(sc.history&&sc.history.length){bars2=sc.history;series2.setData(bars2)}applyFinalized(series2,bars2,sc.finalized_candles);const c=sc.current_candle;updateSeries(series2,bars2,c);if(sc.history&&sc.history.length&&!secondaryRangeSynced){syncSecondaryRange();secondaryRangeSynced=true}}
-function updateFeedDisplay(d){const status=E("feedStatus");if(status){const live=d.mode==="live";status.textContent=live?(d.market_open?"● LIVE":"MARKET CLOSED · LAST QUOTE"):"HISTORICAL REPLAY";status.className="feed-status"+(live?(d.market_open?" live":" closed"):"")}const quotes=d.index_quotes||{},names=["SENSEX","NIFTY","BANKNIFTY"];E("indexStrip").innerHTML=names.map(n=>{const q=quotes[n];return "<span class=\"index-chip\">"+n+" <b>"+(q?"₹"+f(q.ltp)+" ("+(q.change_pct>=0?"+":"")+f(q.change_pct)+"%)":"—")+"</b></span>"}).join("")}function render(d){updateFeedDisplay(d);const c=d.current_candle;if(d.history&&d.history.length){bars=d.history;series.setData(bars)}applyFinalized(series,bars,d.finalized_candles);if(c){updateSeries(series,bars,c);E('name').textContent=d.symbol+' · '+d.interval_label+' · '+d.exchange;E('ltp').textContent=f(c.close);E('change').textContent=d.change_str;E('ohlc').textContent='O '+f(c.open)+' H '+f(c.high)+' L '+f(c.low)+' C '+f(c.close);E('clock').textContent=d.synced_time_str}renderSecondary(d.secondary_chart);E('realized').textContent=(d.realized_pnl>=0?'+₹':'−₹')+f(Math.abs(d.realized_pnl));E('play').textContent=d.is_playing?'⏸ Pause':'▶ Play';const t=d.trade_info,open=!!(t&&t.position);E('none').style.display=open?'none':'block';E('pos').style.display=open?'block':'none';if(open&&c){E('psym').textContent=t.label;E('side').textContent=t.position+' / '+t.qty;E('entry').textContent=f(t.entry_price);E('pltp').textContent=f(c.close);E('psl').textContent=t.sl_price?f(t.sl_price):'—';E('ptarget').textContent=t.target_price?f(t.target_price):'—';E('pnl').textContent=(t.pnl>=0?'+₹':'−₹')+f(Math.abs(t.pnl));drawPosition(t)}else drawPosition(null);if(!d.trade_history||!d.trade_history.length)E('history').textContent='No closed trades.';else E('history').innerHTML=d.trade_history.slice(0,30).map(x=>'<div class="item"><span><b>'+safe(x.symbol)+'</b> '+safe(x.type)+'<br>'+safe(x.reason)+' · '+f(x.entry)+' → '+f(x.exit)+'</span><b class="'+(x.pnl>=0?'green':'red')+'">'+(x.pnl>=0?'+':'−')+'₹'+f(Math.abs(x.pnl))+'</b></div>').join('');if(t&&t.auto_closed)toast('Closed: '+t.reason+' · PnL ₹'+f(t.pnl))}
-async function tick(){if(busy||trial<=0)return;busy=true;try{const endpoint=liveMode?'/api/live_tick'+(liveBootstrapPending?'?bootstrap=1':''):'/api/get_tick'+(bootstrapPending?'?bootstrap=1':'');const data=await api(endpoint);bootstrapPending=false;liveBootstrapPending=false;render(data)}catch(e){E('name').textContent='Data unavailable';if(liveMode)E('feedStatus').textContent='LIVE FEED UNAVAILABLE';if(e.message.indexOf('Access expired')===0){trial=0;E('overlay').style.display='flex'}toast(e.message)}finally{busy=false}}
+function updateFeedDisplay(d){const status=E("feedStatus");if(status){const live=d.mode==="live";status.textContent=live?(d.market_open?"● LIVE":"MARKET CLOSED · LAST QUOTE"):"HISTORICAL REPLAY";status.className="feed-status"+(live?(d.market_open?" live":" closed"):"")}const quotes=d.index_quotes||{},names=["SENSEX","NIFTY","BANKNIFTY"];E("indexStrip").innerHTML=names.map(n=>{const q=quotes[n];return "<span class=\"index-chip\">"+n+" <b>"+(q?"₹"+f(q.ltp)+" ("+(q.change_pct>=0?"+":"")+f(q.change_pct)+"%)":"—")+"</b></span>"}).join("")}function render(d){updateFeedDisplay(d);if(d.selected_date)E("date").value=d.selected_date;const c=d.current_candle;if(d.history&&d.history.length){bars=d.history;series.setData(bars)}applyFinalized(series,bars,d.finalized_candles);if(c){updateSeries(series,bars,c);E('name').textContent=d.symbol+' · '+d.interval_label+' · '+d.exchange;E('ltp').textContent=f(c.close);E('change').textContent=d.change_str;E('ohlc').textContent='O '+f(c.open)+' H '+f(c.high)+' L '+f(c.low)+' C '+f(c.close);E('clock').textContent=d.synced_time_str}renderSecondary(d.secondary_chart);E('realized').textContent=(d.realized_pnl>=0?'+₹':'−₹')+f(Math.abs(d.realized_pnl));E('play').textContent=d.is_playing?'⏸ Pause':'▶ Play';const t=d.trade_info,open=!!(t&&t.position);E('none').style.display=open?'none':'block';E('pos').style.display=open?'block':'none';if(open&&c){E('psym').textContent=t.label;E('side').textContent=t.position+' / '+t.qty;E('entry').textContent=f(t.entry_price);E('pltp').textContent=f(c.close);E('psl').textContent=t.sl_price?f(t.sl_price):'—';E('ptarget').textContent=t.target_price?f(t.target_price):'—';E('pnl').textContent=(t.pnl>=0?'+₹':'−₹')+f(Math.abs(t.pnl));drawPosition(t)}else drawPosition(null);if(!d.trade_history||!d.trade_history.length)E('history').textContent='No closed trades.';else E('history').innerHTML=d.trade_history.slice(0,30).map(x=>'<div class="item"><span><b>'+safe(x.symbol)+'</b> '+safe(x.type)+'<br>'+safe(x.reason)+' · '+f(x.entry)+' → '+f(x.exit)+'</span><b class="'+(x.pnl>=0?'green':'red')+'">'+(x.pnl>=0?'+':'−')+'₹'+f(Math.abs(x.pnl))+'</b></div>').join('');if(t&&t.auto_closed)toast('Closed: '+t.reason+' · PnL ₹'+f(t.pnl))}
+async function tick(){if(busy||trial<=0)return;busy=true;try{const lookback=replayLookbackOverride||({ONE_MINUTE:30,FIVE_MINUTE:100,FIFTEEN_MINUTE:200}[E('interval').value]||30);const endpoint=liveMode?'/api/live_tick'+(liveBootstrapPending?'?bootstrap=1':''):'/api/get_tick'+(bootstrapPending?'?bootstrap=1&lookback='+lookback:'');const data=await api(endpoint);bootstrapPending=false;liveBootstrapPending=false;render(data)}catch(e){E('name').textContent='Data unavailable';if(liveMode)E('feedStatus').textContent='LIVE FEED UNAVAILABLE';if(e.message.indexOf('Access expired')===0){trial=0;E('overlay').style.display='flex'}toast(e.message)}finally{busy=false}}
 async function doRun(fn){try{await fn();await tick()}catch(e){toast(e.message)}}async function change(url,data){bootstrapPending=true;secondaryRangeSynced=false;bars=[];bars2=[];series.setData([]);series2.setData([]);await api(url,{method:'POST',body:data||{}});await tick()}
-E('symbol').addEventListener('change',()=>doRun(()=>change('/api/change_symbol',{symbol:E('symbol').value})));E('interval').addEventListener('change',()=>doRun(()=>change('/api/set_interval',{interval:E('interval').value})));E('date').addEventListener('change',()=>doRun(()=>change('/api/set_date',{date:E('date').value})));E('speed').addEventListener('change',()=>doRun(()=>api('/api/set_speed',{method:'POST',body:{speed:Number(E('speed').value)}})));E('play').addEventListener('click',()=>doRun(()=>api('/api/toggle_play',{method:'POST',body:{}})));E('step').addEventListener('click',()=>doRun(()=>api('/api/step_candle',{method:'POST',body:{}})));E('reset').addEventListener('click',()=>doRun(()=>change('/api/reset_sim',{})));E('fit').addEventListener('click',()=>{chart.timeScale().fitContent();requestAnimationFrame(syncSecondaryRange)});E('line').addEventListener('click',()=>{draw=!draw;E('line').classList.toggle('active',draw)});
+E('symbol').addEventListener('change',()=>doRun(()=>change('/api/change_symbol',{symbol:E('symbol').value})));E('interval').addEventListener('change',()=>doRun(()=>change('/api/set_interval',{interval:E('interval').value})));E('date').addEventListener('change',()=>{replayLookbackOverride=1;doRun(()=>change('/api/set_date',{date:E('date').value}))});E('speed').addEventListener('change',()=>doRun(()=>api('/api/set_speed',{method:'POST',body:{speed:Number(E('speed').value)}})));E('play').addEventListener('click',()=>doRun(()=>api('/api/toggle_play',{method:'POST',body:{}})));E('step').addEventListener('click',()=>doRun(()=>api('/api/step_candle',{method:'POST',body:{}})));E('reset').addEventListener('click',()=>doRun(()=>change('/api/reset_sim',{})));E('fit').addEventListener('click',()=>{chart.timeScale().fitContent();requestAnimationFrame(syncSecondaryRange)});E('line').addEventListener('click',()=>{draw=!draw;E('line').classList.toggle('active',draw)});
 let ocExpiryReady=false;async function loadOptionChain(expiry){const modal=E('optionChainModal');if(modal.style.display!=='flex')return;E('ocRows').innerHTML='<tr><td class="oc-empty" colspan="3">Loading contracts…</td></tr>';E('ocNote').textContent='Fetching Angel One contracts…';try{const q=new URLSearchParams({symbol:E('symbol').value});if(expiry)q.set('expiry',expiry);const d=await api('/api/option_chain?'+q.toString());E('ocTitle').textContent=d.symbol+' Option Chain · '+d.exchange;const sel=E('ocExpiry');if(!ocExpiryReady||sel.dataset.symbol!==d.symbol){sel.innerHTML=d.expiries.map(x=>'<option value="'+safe(x)+'">'+safe(x)+'</option>').join('');sel.dataset.symbol=d.symbol;ocExpiryReady=true}if(d.expiry)sel.value=d.expiry;E('ocNote').textContent=d.rows.length+' strikes · Click any CE/PE contract to add synchronized replay in chart 2. '+d.note;E('ocRows').innerHTML=d.rows.map(r=>'<tr><td class="oc-ce">'+(r.CE?'<button class="oc-select oc-contract" data-underlying="'+safe(d.symbol)+'" data-symbol="'+safe(r.CE.symbol)+'" data-token="'+safe(r.CE.token)+'" data-lot="'+safe(r.CE.lot_size)+'">'+safe(r.CE.symbol)+'</button><br><small>Lot '+safe(r.CE.lot_size)+'</small>':'—')+'</td><td>'+Number(r.strike).toLocaleString('en-IN',{maximumFractionDigits:4})+'</td><td class="oc-pe">'+(r.PE?'<button class="oc-select oc-contract" data-underlying="'+safe(d.symbol)+'" data-symbol="'+safe(r.PE.symbol)+'" data-token="'+safe(r.PE.token)+'" data-lot="'+safe(r.PE.lot_size)+'">'+safe(r.PE.symbol)+'</button><br><small>Lot '+safe(r.PE.lot_size)+'</small>':'—')+'</td></tr>').join('')}catch(e){E('ocRows').innerHTML='<tr><td class="oc-empty" colspan="3">'+safe(e.message)+'</td></tr>';E('ocNote').textContent='Option chain unavailable'}}E('optionChainBtn').addEventListener('click',()=>{E('optionChainModal').style.display='flex';loadOptionChain(E('ocExpiry').value)});E('ocClose').addEventListener('click',()=>E('optionChainModal').style.display='none');E('optionChainModal').addEventListener('click',e=>{if(e.target===E('optionChainModal'))E('optionChainModal').style.display='none'});E('ocRefresh').addEventListener('click',()=>loadOptionChain(E('ocExpiry').value));E('ocExpiry').addEventListener('change',()=>loadOptionChain(E('ocExpiry').value));document.addEventListener('keydown',e=>{if(e.key==='Escape')E('optionChainModal').style.display='none'});E('symbol').addEventListener('change',()=>{if(E('optionChainModal').style.display==='flex')loadOptionChain('')});E('theme').addEventListener('click',()=>{document.body.classList.toggle('light');const l=document.body.classList.contains('light'),o={layout:{background:{color:l?'#fff':'#131722'},textColor:l?'#131722':'#d1d4dc'}};chart.applyOptions(o);chart2.applyOptions(o)});
-E('chartModeBtn').textContent=splitMode?'Single Chart':'2 Charts';function applyChartMode(){const root=E('charts');root.style.setProperty('--primary-share',(paneShare*100)+'%');root.classList.toggle('split',splitMode);E('chartModeBtn').textContent=splitMode?'Single Chart':'2 Charts';E('secondaryPlaceholder').style.display=splitMode&&!secondaryEnabled?'flex':'none';requestAnimationFrame(()=>{resizeCharts();syncSecondaryRange()})}E('chartModeBtn').addEventListener('click',()=>{splitMode=!splitMode;applyChartMode()});E('liveModeBtn').addEventListener('click',async()=>{liveMode=!liveMode;liveBootstrapPending=liveMode;bootstrapPending=!liveMode;bars=[];bars2=[];series.setData([]);series2.setData([]);E('liveModeBtn').textContent=liveMode?'↩ Replay':'● Live';E('liveModeBtn').classList.toggle('live-active',liveMode);try{await tick()}catch(e){toast(e.message)}});let tradingPanelVisible=true;E('toggleTradingPanel').addEventListener('click',()=>{tradingPanelVisible=!tradingPanelVisible;E('layout').classList.toggle('panel-collapsed',!tradingPanelVisible);E('toggleTradingPanel').textContent=tradingPanelVisible?'Hide panel ▸':'Show panel ◂';E('toggleTradingPanel').setAttribute('aria-expanded',String(tradingPanelVisible));requestAnimationFrame(()=>{resizeCharts();if(tradingPanelVisible)syncSecondaryRange()})});E('clearSecondary').addEventListener('click',()=>doRun(async()=>{await api('/api/clear_option',{method:'POST',body:{}});secondaryEnabled=false;splitMode=false;bars2=[];series2.setData([]);applyChartMode()}));E('ocRows').addEventListener('click',e=>{const b=e.target.closest('.oc-select');if(!b)return;doRun(async()=>{await api('/api/select_option',{method:'POST',body:{underlying:b.dataset.underlying,symbol:b.dataset.symbol,token:b.dataset.token}});secondaryEnabled=true;splitMode=true;secondaryRangeSynced=false;bars2=[];series2.setData([]);E('secondaryTitle').textContent=b.dataset.symbol;E('secondaryPlaceholder').style.display='none';E('optionChainModal').style.display='none';applyChartMode()})});if(secondaryEnabled){splitMode=true;applyChartMode()}async function order(side){await doRun(()=>api('/api/trade',{method:'POST',body:{action:side,lots:Number(E('lots').value),sl_points:Number(E('sl').value),target_points:Number(E('target').value),tsl_points:Number(E('trail').value)}}))}E('long').addEventListener('click',()=>order('LONG'));E('short').addEventListener('click',()=>order('SHORT'));E('square').addEventListener('click',()=>doRun(()=>api('/api/close_trade',{method:'POST',body:{}})));
+E('chartModeBtn').textContent=splitMode?'Single Chart':'2 Charts';function applyChartMode(){const root=E('charts');root.style.setProperty('--primary-share',(paneShare*100)+'%');root.classList.toggle('split',splitMode);E('chartModeBtn').textContent=splitMode?'Single Chart':'2 Charts';E('secondaryPlaceholder').style.display=splitMode&&!secondaryEnabled?'flex':'none';requestAnimationFrame(()=>{resizeCharts();syncSecondaryRange()})}E('chartModeBtn').addEventListener('click',()=>{splitMode=!splitMode;applyChartMode()});E('liveModeBtn').addEventListener('click',async()=>{liveMode=!liveMode;replayLookbackOverride=null;liveBootstrapPending=liveMode;bootstrapPending=!liveMode;bars=[];bars2=[];series.setData([]);series2.setData([]);E('liveModeBtn').textContent=liveMode?'↩ Replay':'● Live';E('liveModeBtn').classList.toggle('live-active',liveMode);try{await tick()}catch(e){toast(e.message)}});let tradingPanelVisible=true;E('toggleTradingPanel').addEventListener('click',()=>{tradingPanelVisible=!tradingPanelVisible;E('layout').classList.toggle('panel-collapsed',!tradingPanelVisible);E('toggleTradingPanel').textContent=tradingPanelVisible?'Hide panel ▸':'Show panel ◂';E('toggleTradingPanel').setAttribute('aria-expanded',String(tradingPanelVisible));requestAnimationFrame(()=>{resizeCharts();if(tradingPanelVisible)syncSecondaryRange()})});E('clearSecondary').addEventListener('click',()=>doRun(async()=>{await api('/api/clear_option',{method:'POST',body:{}});secondaryEnabled=false;splitMode=false;bars2=[];series2.setData([]);applyChartMode()}));E('ocRows').addEventListener('click',e=>{const b=e.target.closest('.oc-select');if(!b)return;doRun(async()=>{await api('/api/select_option',{method:'POST',body:{underlying:b.dataset.underlying,symbol:b.dataset.symbol,token:b.dataset.token}});secondaryEnabled=true;splitMode=true;secondaryRangeSynced=false;bars2=[];series2.setData([]);E('secondaryTitle').textContent=b.dataset.symbol;E('secondaryPlaceholder').style.display='none';E('optionChainModal').style.display='none';applyChartMode()})});if(secondaryEnabled){splitMode=true;applyChartMode()}async function order(side){await doRun(()=>api('/api/trade',{method:'POST',body:{action:side,lots:Number(E('lots').value),sl_points:Number(E('sl').value),target_points:Number(E('target').value),tsl_points:Number(E('trail').value)}}))}E('long').addEventListener('click',()=>order('LONG'));E('short').addEventListener('click',()=>order('SHORT'));E('square').addEventListener('click',()=>doRun(()=>api('/api/close_trade',{method:'POST',body:{}})));
 if(!fullAccess)setInterval(()=>{if(trial>0){trial--;E('trial').textContent='Trial '+Math.floor(trial/60)+':'+String(trial%60).padStart(2,'0')}if(trial<=0){E('overlay').style.display='flex';E('trial').textContent='Trial ended'}},1000);initChart();tick();setInterval(()=>{if(!liveMode)tick()},100);setInterval(()=>{if(liveMode)tick()},1000)
 })();
 </script></body></html>"""
@@ -819,7 +901,33 @@ def api_live_tick():
     now_ist = datetime.now(IST)
     today = now_ist.date().isoformat()
     market_open = now_ist.weekday() < 5 and clock_time(9, 15) <= now_ist.time().replace(tzinfo=None) <= clock_time(15, 30)
+    # Live always anchors replay to today's market session. Clear an old cached
+    # replay day once when switching over, so Replay can reload today's data.
+    if state.selected_date != today or rows_of(state):
+        with state_lock:
+            # Replay-to-live may have cached a morning snapshot. Force the
+            # next Replay switch to ask Angel One for the latest available bars.
+            with cache_lock:
+                for history_key in tuple(history_cache):
+                    if len(history_key) > 3 and history_key[3] == today:
+                        history_cache.pop(history_key, None)
+            state.selected_date = today
+            state.real_data_json = "[]"
+            state.candle_index = 0
+            state.candle_progress = 0
+            state.is_playing = True
+            state.needs_history_reload = True
+            state.last_tick_at = time.time()
+            state.smooth_price = state.current_high = state.current_low = 0
+            state.secondary_data_json = "[]"
+            state.secondary_needs_history_reload = True
+            state.secondary_last_index = -1
+            state.secondary_active_time = ""
+            state.secondary_smooth_price = state.secondary_high = state.secondary_low = 0
     bootstrap = request.args.get("bootstrap") == "1"
+    if bootstrap:
+        state.is_playing = True
+        state.last_tick_at = time.time()
     primary_history = []
     if bootstrap:
         try:
@@ -829,6 +937,8 @@ def api_live_tick():
             log.info("Live chart history is not ready; starting from the next live tick.")
     seed = primary_history[-1] if primary_history else None
     candle = make_live_candle(user.id, instrument["exchange"], instrument["token"], state.interval, price, seed)
+    save_live_candle(user.id, state.symbol, state.symbol, instrument["exchange"], instrument["token"],
+                     state.interval, today, candle)
 
     secondary = None
     if state.secondary_symbol and state.secondary_token and state.secondary_exchange:
@@ -845,6 +955,8 @@ def api_live_tick():
             option_seed = option_history[-1] if option_history else None
             option_candle = make_live_candle(user.id, state.secondary_exchange.upper(), state.secondary_token,
                                              state.interval, option_price, option_seed)
+            save_live_candle(user.id, state.symbol, state.secondary_symbol, state.secondary_exchange.upper(),
+                             state.secondary_token, state.interval, today, option_candle)
             secondary = {"symbol": state.secondary_symbol, "interval_label": INTERVALS.get(state.interval, "1m"),
                          "history": option_history if bootstrap else [], "current_candle": option_candle}
         else:
@@ -1052,14 +1164,26 @@ def close_trade():
 def get_tick():
     user,s=current_user_state()
     with state_lock:
+        try:
+            lookback_days = max(1, min(int(request.args.get("lookback", "1")), max_history_days(s.interval)))
+        except (TypeError, ValueError):
+            lookback_days = 1
         rows=rows_of(s)
         if not rows:
-            try: rows=fetch_candles(s.symbol,s.interval,s.selected_date)
-            except ValueError as e:return jsonify(status="error",message=str(e)),409
+            try: rows=fetch_candles(s.symbol,s.interval,s.selected_date,lookback_days)
+            except ValueError as e:
+                rows=[]
+                history_error=str(e)
             except Exception as e:
                 log.exception("Historical candle load failed")
-                return jsonify(status="error",message=str(e)),503
-            if not rows:return jsonify(status="error",message="No candles for this date (holiday, weekend, or broker data limit)."),404
+                rows=[]
+                history_error=str(e)
+            rows = merge_recorded_live_candles(
+                rows, s.user_id, s.symbol, INDICES[s.symbol]["exchange"],
+                INDICES[s.symbol]["token"], s.interval, s.selected_date
+            )
+            if not rows:
+                return jsonify(status="error",message=locals().get("history_error", "No candles for this date (holiday, weekend, or broker data limit).")),404
             s.real_data_json=json.dumps(rows,separators=(",",":"));s.candle_index=0;s.candle_progress=0;s.needs_history_reload=True;s.last_tick_at=time.time();reset_bounds(s,rows)
         s.candle_index=min(max(s.candle_index,0),len(rows)-1);previous_index=s.candle_index;now=time.time()
         if s.is_playing:
@@ -1104,7 +1228,9 @@ def get_tick():
         dt=datetime.fromisoformat(c[0]);day_open=float(rows[0][1]);change=price-day_open;pct=change/day_open*100 if day_open else 0
         chart_dt = dt.replace(tzinfo=IST) if dt.tzinfo is None else dt
         result={"status":"success","is_playing":bool(s.is_playing),"current_candle":{"time":int(chart_dt.timestamp()),"open":op,"high":s.current_high,"low":s.current_low,"close":price},"history":history,"finalized_candles":finalized,"trade_info":ti,"realized_pnl":s.realized_pnl,"trade_history":history_of(s),"symbol":s.symbol,"exchange":INDICES[s.symbol]["exchange"],"interval_label":INTERVALS.get(s.interval, "5m"),"change_value":round(change,2),"change_str":f"{'+' if change>=0 else ''}{change:.2f} ({pct:.2f}%)","selected_date":s.selected_date,"synced_time_str":dt.strftime("%d %b %Y  %H:%M:%S IST")}
-        result["secondary_chart"] = secondary_chart_tick(s, c, p, request.args.get("bootstrap") == "1")
+        result["secondary_chart"] = secondary_chart_tick(
+            s, c, p, request.args.get("bootstrap") == "1", lookback_days
+        )
         db.session.commit();return jsonify(result)
 
 
