@@ -1,6 +1,2 @@
-Flask
-Flask-SQLAlchemy
-smartapi-python
-pyotp
-gunicorn
-psycopg[binary]
+logzero
+websocket-client
