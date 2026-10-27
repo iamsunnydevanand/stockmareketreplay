@@ -11,13 +11,11 @@ import random
 app = Flask(__name__)
 app.secret_key = "sunny_dev_anand_secret_123"
 
-# Render ke liye database path
 db_path = os.environ.get('DATABASE_PATH', 'final_app.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# --- DATABASE MODEL ---
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
@@ -32,7 +30,6 @@ with app.app_context():
         db.session.add(admin)
         db.session.commit()
 
-# --- APNI SMARTAPI DETAILS ---
 api_key = "BAq0de8E"                 
 client_id = "S1263568"               
 password = "7313"                    
@@ -41,7 +38,6 @@ totp_secret = "LY4QG5NPAOBDYIZXODIDWLQKN4"
 obj = SmartConnect(api_key=api_key)
 session_initialized = False
 
-# --- ALL MAJOR INDIAN INDICES (NSE & BSE) ---
 INDICES = {
     "SENSEX":     {"token": "99919000", "exchange": "BSE", "name": "SENSEX",     "lot": 10, "step": 100},
     "BANKEX":     {"token": "99919001", "exchange": "BSE", "name": "BANKEX",     "lot": 15, "step": 100},
@@ -66,12 +62,10 @@ is_playing = True
 playback_speed = 1 
 needs_history_reload = True
 
-# Smooth Tick State
 smooth_price = 0.0
 current_high = 0.0
 current_low = 0.0
 
-# Paper Trading State
 position = None          
 instrument_label = "SENSEX"
 entry_price = 0.0
@@ -123,7 +117,6 @@ def execute_square_off(exit_price, reason="Manual"):
     position = None; entry_price = 0.0; sl_price = 0.0; target_price = 0.0; tsl_points = 0.0; pnl = 0.0
     return final_pnl
 
-# --- OWNER INFO HTML ---
 OWNER_HTML = """
 <div style="margin-top:20px; padding:15px; background:#131722; border:1px solid #2962ff; border-radius:8px; text-align:center; font-size:12px;">
     <h4 style="margin:0 0 5px 0; color:#089981;">Owner Info</h4>
@@ -134,13 +127,10 @@ OWNER_HTML = """
 </div>
 """
 
-# --- AUTH ROUTES ---
 @app.route('/')
 def index():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-    if session.get('is_admin'):
-        return redirect(url_for('admin_panel'))
+    if 'user_id' not in session: return redirect(url_for('login'))
+    if session.get('is_admin'): return redirect(url_for('admin_panel'))
     return redirect(url_for('home'))
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -192,7 +182,6 @@ def toggle_user(user_id):
         if user: user.is_active = not user.is_active; db.session.commit()
     return redirect(url_for('admin_panel'))
 
-# --- TERMINAL ROUTE ---
 @app.route('/terminal')
 def home():
     if 'user_id' not in session: return redirect(url_for('login'))
@@ -205,7 +194,6 @@ def home():
     trial_remaining = max(0, 120 - int(time.time() - session.get('login_time', time.time())))
     return render_template_string(HTML_PAGE, trial=trial_remaining, username=session['username'])
 
-# --- API ROUTES ---
 @app.route('/api/change_symbol/<symbol>')
 def change_symbol(symbol):
     global current_symbol, real_data, current_candle_index, candle_progress, needs_history_reload
@@ -294,6 +282,7 @@ def get_tick():
 
     now = time.time()
     if is_playing:
+        # 12.0 seconds per candle (5-min simulation)
         candle_progress += ((now - last_real_time) / 12.0) * playback_speed
         last_real_time = now
         if candle_progress >= 1.0:
@@ -314,7 +303,7 @@ def get_tick():
     c = real_data[current_candle_index]
     open_p, high_p, low_p, close_p = float(c[1]), float(c[2]), float(c[3]), float(c[4])
 
-    # Smooth Tick Logic
+    # === SMOOTH TICK LOGIC (Ultra Smooth) ===
     if candle_progress < 0.35:
         target_p = low_p if close_p >= open_p else high_p
         guide_p = open_p + (target_p - open_p) * (candle_progress / 0.35)
@@ -327,8 +316,12 @@ def get_tick():
         guide_p = start_p + (close_p - start_p) * min((candle_progress - 0.75) / 0.25, 1.0)
 
     if smooth_price == 0.0: smooth_price = open_p
-    micro_noise = random.uniform(-0.35, 0.35) * max(1.0, (high_p - low_p) * 0.02)
-    smooth_price = smooth_price + (guide_p - smooth_price) * 0.35 + micro_noise
+    
+    # Micro noise kam kiya hai taaki smooth lage
+    micro_noise = random.uniform(-0.15, 0.15) * max(1.0, (high_p - low_p) * 0.01)
+    
+    # Smoothing factor badhaya hai (0.35 se 0.20) taaki price slow move kare
+    smooth_price = smooth_price + (guide_p - smooth_price) * 0.20 + micro_noise
     current_price = round(max(low_p, min(high_p, smooth_price)), 2)
 
     if candle_progress > 0.94:
@@ -450,7 +443,6 @@ def close_trade():
     final_pnl = execute_square_off(last_ltp, reason="Manual")
     return jsonify({"status": "success", "final_pnl": final_pnl})
 
-# --- HTML TEMPLATES ---
 LOGIN_HTML = f"""
 <!DOCTYPE html><html><head><title>Login</title>
 <style>body{{background:#131722;color:white;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}}.box{{background:#1e222d;padding:40px;border-radius:10px;width:350px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);}}h2{{margin-top:0;color:#2962ff;}}input{{width:100%;padding:10px;margin:10px 0;background:#131722;border:1px solid #2a2e39;color:white;border-radius:5px;box-sizing:border-box;}}button{{width:100%;padding:10px;background:#2962ff;color:white;border:none;border-radius:5px;cursor:pointer;font-weight:bold;margin-top:10px;}}.error{{color:#ef5350;margin-bottom:10px;}}</style></head>
