@@ -205,7 +205,7 @@ def home():
     trial_remaining = max(0, 120 - int(time.time() - session.get('login_time', time.time())))
     return render_template_string(HTML_PAGE, trial=trial_remaining, username=session['username'])
 
-# --- API ROUTES (ORIGINAL LOGIC, NO CHANGES) ---
+# --- API ROUTES ---
 @app.route('/api/change_symbol/<symbol>')
 def change_symbol(symbol):
     global current_symbol, real_data, current_candle_index, candle_progress, needs_history_reload
@@ -231,9 +231,9 @@ def set_speed(speed):
 
 @app.route('/api/set_date')
 def set_date():
-    global selected_date, real_data, current_candle_index, candle_progress, needs_history_reload
+    global selected_date, real_data, current_candle_index, candle_progress, needs_history_reload, last_real_time
     selected_date = request.args.get('date')
-    real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True
+    real_data = []; current_candle_index = 0; candle_progress = 0.0; needs_history_reload = True; last_real_time = time.time()
     return jsonify({"status": "success", "selected_date": selected_date})
 
 @app.route('/api/toggle_play', methods=['POST'])
@@ -314,7 +314,7 @@ def get_tick():
     c = real_data[current_candle_index]
     open_p, high_p, low_p, close_p = float(c[1]), float(c[2]), float(c[3]), float(c[4])
 
-    # === SMOOTH TICK LOGIC (Original) ===
+    # Smooth Tick Logic
     if candle_progress < 0.35:
         target_p = low_p if close_p >= open_p else high_p
         guide_p = open_p + (target_p - open_p) * (candle_progress / 0.35)
@@ -490,7 +490,6 @@ HTML_PAGE = """
   <title>Sunny's Terminal</title>
   <script src="https://unpkg.com/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.js"></script>
   <style>
-    /* [Aapka same CSS, jo aapne diya hai] */
     :root { --bg-main: #ffffff; --bg-panel: #f8f9fd; --bg-hover: #f0f3fa; --bg-active: #e1ecff; --text-main: #131722; --text-muted: #787b86; --border-color: #e0e3eb; --grid-color: #f2f4f9; --overlay-bg: rgba(255, 255, 255, 0.90); --card-shadow: rgba(0, 0, 0, 0.10); }
     body.dark-mode { --bg-main: #131722; --bg-panel: #1e222d; --bg-hover: #2a2e39; --bg-active: #1e3a8a; --text-main: #d1d4dc; --text-muted: #868993; --border-color: #2a2e39; --grid-color: #1f232e; --overlay-bg: rgba(19, 23, 34, 0.90); --card-shadow: rgba(0, 0, 0, 0.50); }
     * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-font-smoothing: antialiased; }
