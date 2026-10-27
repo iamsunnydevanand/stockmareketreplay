@@ -1355,4 +1355,4 @@ def internal_error(error):
 if __name__ == "__main__":
     print("Paper Trading Replay Terminal: http://127.0.0.1:5000")
     print("Default admin login: admin / admin123")
-    app.run(host=os.environ.get("HOST","127.0.0.1"),port=int(os.environ.get("PORT","5000")),debug=False,use_reloader=False,threaded=True)
+    app.run(host=os.environ.get("HOST","127.0.0.1"),port=int(os.environ.get("PORT","5001")),debug=False,use_reloader=False,threaded=True)
