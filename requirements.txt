@@ -1,8 +1,6 @@
 Flask
 Flask-SQLAlchemy
-Werkzeug
 smartapi-python
 pyotp
 gunicorn
-logzero
-websocket-client
+psycopg[binary]
