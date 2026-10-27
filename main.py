@@ -150,7 +150,8 @@ with app.app_context():
             "secondary_symbol": "VARCHAR(80)", "secondary_token": "VARCHAR(32)",
             "secondary_exchange": "VARCHAR(8)", "secondary_lot": "INTEGER NOT NULL DEFAULT 1",
             "secondary_data_json": "TEXT NOT NULL DEFAULT '[]'",
-            "secondary_needs_history_reload": "BOOLEAN NOT NULL DEFAULT 1",
+            # TRUE is valid PostgreSQL Boolean syntax and SQLite also accepts it.
+            "secondary_needs_history_reload": "BOOLEAN NOT NULL DEFAULT TRUE",
             "secondary_last_index": "INTEGER NOT NULL DEFAULT -1",
             "secondary_active_time": "VARCHAR(40) NOT NULL DEFAULT ''",
             "secondary_smooth_price": "FLOAT NOT NULL DEFAULT 0",
